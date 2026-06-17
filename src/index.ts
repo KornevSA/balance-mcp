@@ -1,14 +1,13 @@
 // HTTP entrypoint: streamable-HTTP MCP-сервер + OAuth Resource Server.
-import express, { type Request, type Response } from "express";
+import express, { type Request, type Response, type NextFunction } from "express";
 import cors from "cors";
 import { randomUUID } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
-import { mcpAuthMetadataRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { CFG } from "./config.js";
-import { buildOAuthMetadata, SCOPES_SUPPORTED } from "./auth/metadata.js";
-import { tokenVerifier, setIntrospectCreds } from "./auth/tokenVerifier.js";
+import { SCOPES_SUPPORTED } from "./auth/metadata.js";
+import { makeTokenVerifier, setIntrospectCreds } from "./auth/tokenVerifier.js";
 import { resolveIntrospectCreds } from "./auth/introspectClient.js";
 import { createMcpServer } from "./server.js";
 
@@ -23,33 +22,46 @@ app.use(cors({
 // Health (без авторизации) — для docker healthcheck.
 app.get("/healthz", (_req, res) => { res.json({ ok: true, service: "balance-mcp" }); });
 
-const resourceUrl = new URL(CFG.publicUrl);
+// Канонический публичный базовый URL вычисляем ИЗ ЗАПРОСА (как PHP-AS balance),
+// а не из ENV — тогда коннектор работает на любом домене без прод-конфига и не
+// «залипает» на localhost, если прод-.env не задан. Apache balance-web проксирует
+// /mcp с `ProxyPreserveHost On` и пробрасывает X-Forwarded-Proto, выставленный NPM,
+// поэтому здесь видно реальный `https://balance.99p.ru`. X-Forwarded-* может прийти
+// списком — берём первый элемент.
+function reqBase(req: Request): string {
+  const xfHost = String(req.headers["x-forwarded-host"] || "").split(",")[0].trim();
+  const xfProto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim();
+  const host = xfHost || String(req.headers["host"] || "localhost");
+  const proto = xfProto || (req.secure ? "https" : "http");
+  return `${proto}://${host}`;
+}
 
-// Алиас «голого» пути PRM — некоторые клиенты пробуют его без суффикса /mcp.
-// (SDK-router отдаёт path-суффиксный …/oauth-protected-resource/mcp, на который и
-//  указывает WWW-Authenticate; этот алиас — для совместимости.)
-app.get("/.well-known/oauth-protected-resource", (_req, res) => {
-  res.json({
-    resource: CFG.publicUrl,
-    authorization_servers: [CFG.oauthPublic],
+// RFC 9728: Protected Resource Metadata. Отдаём оба пути — «голый» (некоторые
+// клиенты пробуют без суффикса) и path-суффиксный `…/mcp`, на который указывает
+// WWW-Authenticate. authorization_servers = тот же origin (там же живёт balance-AS).
+function prmBody(base: string) {
+  return {
+    resource: `${base}/mcp`,
+    authorization_servers: [base],
     scopes_supported: SCOPES_SUPPORTED,
     resource_name: "Balance Billing MCP",
+  };
+}
+app.get("/.well-known/oauth-protected-resource", (req, res) => { res.json(prmBody(reqBase(req))); });
+app.get("/.well-known/oauth-protected-resource/mcp", (req, res) => { res.json(prmBody(reqBase(req))); });
+
+// Bearer-auth: resource_metadata в WWW-Authenticate и ожидаемый audience —
+// оба привязаны к домену запроса (см. reqBase). Конструируем middleware
+// по-запросно: это дёшево (замыкание), а URL/аудиенс получаются корректными
+// для любого хоста, через который пришёл запрос.
+function authMiddleware(req: Request, res: Response, next: NextFunction): void {
+  const base = reqBase(req);
+  const mw = requireBearerAuth({
+    verifier: makeTokenVerifier(`${base}/mcp`),
+    resourceMetadataUrl: `${base}/.well-known/oauth-protected-resource/mcp`,
   });
-});
-
-// RFC 9728: /.well-known/oauth-protected-resource(/mcp) → указывает на AS (balance).
-app.use(mcpAuthMetadataRouter({
-  oauthMetadata: buildOAuthMetadata(),
-  resourceServerUrl: resourceUrl,
-  scopesSupported: SCOPES_SUPPORTED,
-  resourceName: "Balance Billing MCP",
-}));
-
-// На 401 отдаём WWW-Authenticate с resource_metadata.
-const authMiddleware = requireBearerAuth({
-  verifier: tokenVerifier,
-  resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resourceUrl),
-});
+  void mw(req, res, next);
+}
 
 app.use(express.json({ limit: "32mb" }));
 
@@ -87,7 +99,7 @@ app.get("/mcp", authMiddleware, sessionRequest);
 app.delete("/mcp", authMiddleware, sessionRequest);
 
 app.listen(CFG.port, () => {
-  console.log(`[balance-mcp] listening on :${CFG.port}  resource=${CFG.publicUrl}  api=${CFG.balanceApiBase}`);
+  console.log(`[balance-mcp] listening on :${CFG.port}  resource=<из запроса: X-Forwarded-Host/Proto>  api=${CFG.balanceApiBase}`);
 });
 
 // Резолвим introspection-креды (ENV → volume-кэш → DCR-саморегистрация) в фоне,
