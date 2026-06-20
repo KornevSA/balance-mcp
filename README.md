@@ -11,7 +11,8 @@ TypeScript + `@modelcontextprotocol/sdk`, транспорт **streamable HTTP**
 
 | Tool | Назначение |
 |---|---|
-| `find_or_create_customer`, `search_customers`, `get_customer` | контрагенты (идемпотентно по ИНН) |
+| `find_or_create_customer`, `search_customers`, `get_customer` | контрагенты (идемпотентно по ИНН; `name` необязателен — тянется из ЕГРЮЛ по ИНН) |
+| `lookup_company_by_inn` | реквизиты юрлица/ИП по ИНН из ЕГРЮЛ (DaData), без создания КА |
 | `create_invoice` | выставить счёт (+PDF через `get_document_pdf`) |
 | `list_customer_documents`, `get_document`, `get_document_pdf` | документы и их PDF |
 | `search_documents`, `documents_summary` | **кросс-КА поиск за период** (стр./полностью) и сводка |

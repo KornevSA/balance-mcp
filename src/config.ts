@@ -26,4 +26,10 @@ export const CFG = {
 
   // Порог инлайна файла (base64) в ответе тулза.
   inlineMaxBytes: parseInt(process.env.MCP_INLINE_MAX_BYTES || String(5 * 1024 * 1024), 10),
+
+  // DaData (ЕГРЮЛ) — авто-резолв наименования/реквизитов контрагента по ИНН.
+  // Пустой токен = резолвер выключен (find_or_create_customer требует name).
+  dadataToken: process.env.DADATA_TOKEN || "",
+  // Форма наименования из ЕГРЮЛ: "full" (полное с ОПФ) или "short". По умолчанию full.
+  dadataNameForm: (process.env.DADATA_NAME_FORM || "full").toLowerCase() === "short" ? "short" : "full",
 };
