@@ -98,6 +98,45 @@ export function registerCustomerTools(server: McpServer) {
     return ok(`Контрагент создан: #${created.data?.customer_id}${nameNote} — ${name}`, created.data);
   });
 
+  server.registerTool("update_customer", {
+    title: "Обновить контрагента",
+    description:
+      "Частично обновить карточку КА (PATCH). Передавайте только изменяемые поля. " +
+      "Полезно, чтобы починить тип взаиморасчётов (acc_type_id: 0/1=по оплатам — автосоздание актов работает, " +
+      "2=по затратам за месяц, 3=акты вручную — оба вне автосоздания), сменить орг-эмитента (org_id), " +
+      "дилер-группу (customer_group_id) или реквизиты. ИНН при смене проверяется на конфликт с другим КА. " +
+      "Изменения пишутся в аудит (было→стало).",
+    inputSchema: {
+      id: z.number().int().positive().describe("customer_id"),
+      name: z.string().optional(),
+      inn: z.string().optional(),
+      kpp: z.string().optional(),
+      email: z.string().optional(),
+      phone: z.string().optional(),
+      urpost: z.string().optional().describe("Юр. адрес"),
+      post: z.string().optional().describe("Почтовый адрес"),
+      bank_name: z.string().optional(),
+      bik: z.string().optional(),
+      rnum: z.string().optional().describe("Расчётный счёт"),
+      kor_num: z.string().optional().describe("Корр. счёт"),
+      official: z.string().optional().describe("Руководитель (ФИО)"),
+      official_func: z.string().optional().describe("Должность руководителя"),
+      act_base: z.string().optional().describe("Действует на основании"),
+      comment: z.string().optional(),
+      acc_type_id: z.number().int().optional().describe("Тип взаиморасчётов: 0/1=по оплатам, 2=по затратам за месяц, 3=акты вручную"),
+      org_id: z.number().int().optional().describe("Орг-эмитент по умолчанию"),
+      customer_group_id: z.number().int().optional().describe("Дилер-группа"),
+    },
+  }, async (a, extra) => {
+    const { id, ...rest } = a;
+    const body: any = {};
+    for (const [k, v] of Object.entries(rest)) if (v !== undefined) body[k] = v;
+    if (Object.keys(body).length === 0) return fail("Нечего обновлять: передайте хотя бы одно поле кроме id.");
+    const env = await balanceCall(tokenOf(extra), "PATCH", `/customers/${id}`, body);
+    if (!env.ok) return fail(env.error.message);
+    return ok(`Контрагент #${id} обновлён (${Object.keys(body).join(", ")})`, env.data);
+  });
+
   server.registerTool("lookup_company_by_inn", {
     title: "Реквизиты по ИНН (ЕГРЮЛ)",
     description:
