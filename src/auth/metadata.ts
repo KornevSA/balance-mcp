@@ -12,6 +12,7 @@ export const SCOPES_SUPPORTED = [
   "me:files:write",
   "organizations:read",
   "kb:read",
+  "kb:write",
   "positions:read",
   "tasks:read",
   "tasks:write",
