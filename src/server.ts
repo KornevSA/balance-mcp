@@ -10,6 +10,7 @@ import { registerContractTools } from "./tools/contracts.js";
 import { registerKbTools } from "./tools/kb.js";
 import { registerPositionTools } from "./tools/positions.js";
 import { registerTaskTools } from "./tools/tasks.js";
+import { registerUserTools } from "./tools/users.js";
 
 export function createMcpServer(): McpServer {
   const server = new McpServer({ name: "balance-mcp", version: "0.1.0" });
@@ -24,5 +25,6 @@ export function createMcpServer(): McpServer {
   registerKbTools(server);
   registerPositionTools(server);
   registerTaskTools(server);
+  registerUserTools(server);
   return server;
 }
