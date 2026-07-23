@@ -33,8 +33,26 @@ export function publicBaseOf(extra: any): string {
   return host ? `${proto}://${host}` : "";
 }
 
+// Успешный результат тулза.
+//
+// ВАЖНО: полезную нагрузку кладём В ТЕКСТОВЫЙ БЛОК (content), а не только в
+// structuredContent. MCP-клиенты (коннектор Claude.ai, Claude Code) показывают
+// модели именно text-блоки; structuredContent надёжно используется лишь когда у
+// тулза объявлена outputSchema — а у наших тулзов её нет. Без дублирования в text
+// модель видела только «шапку» вида «Статей: 5», а сам список/тело статьи терялись
+// (регресс, воспроизведён 23.07: list_kb_articles / list_kb_categories /
+// list_positions / get_kb_article отдавали только счётчик). Спека MCP прямо требует
+// дублировать структурированный ответ в TextContent для обратной совместимости.
+// Держим ОДИН text-блок (сводка + компактный JSON) — так исключаем и риск «до
+// клиента дошёл только первый блок». structuredContent оставляем: не мешает и
+// помогает клиентам, которые умеют его читать.
 export function ok(text: string, structured?: any) {
-  const r: any = { content: [{ type: "text", text }] };
+  const r: any = {
+    content: [{
+      type: "text",
+      text: structured === undefined ? text : `${text}\n${JSON.stringify(structured)}`,
+    }],
+  };
   if (structured !== undefined) r.structuredContent = structured;
   return r;
 }
