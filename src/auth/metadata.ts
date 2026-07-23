@@ -7,8 +7,14 @@ export const SCOPES_SUPPORTED = [
   "invoices:write",
   "documents:read",
   "files:read",
+  "files:write",
   "me:files:read",
   "me:files:write",
+  "organizations:read",
+  "kb:read",
+  "positions:read",
+  "tasks:read",
+  "tasks:write",
 ];
 
 // Метаданные Authorization Server (balance). Публикуем ТОЛЬКО публичные URL —
