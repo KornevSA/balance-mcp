@@ -2,6 +2,7 @@
 // balance /oauth/introspect (RFC 7662) + сверка audience (RFC 8707) + кэш.
 import { checkResourceAllowed } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
+import { InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { CFG } from "../config.js";
 
 type CacheEntry = { info: AuthInfo; expEpoch: number };
@@ -44,7 +45,13 @@ export function makeTokenVerifier(expectedResource: string) {
       });
       if (!r.ok) throw new Error(`introspection failed: HTTP ${r.status}`);
       const d: any = await r.json();
-      if (!d || d.active !== true) throw new Error("inactive token");
+      // ВАЖНО: именно InvalidTokenError — bearerAuth SDK превращает его в 401 с
+      // WWW-Authenticate, а любую другую ошибку в 500 server_error. На 500 клиент
+      // Claude не обновляет токен и просто показывает «Tool execution failed», т.е.
+      // коннектор молча умирает, когда access-токен протух или был отозван.
+      // Текст ТОЛЬКО ASCII: SDK кладёт его в заголовок WWW-Authenticate, а кириллица
+      // в значении заголовка — ERR_INVALID_CHAR и падение процесса (поймано на dev).
+      if (!d || d.active !== true) throw new InvalidTokenError("Token is inactive or expired");
 
       // audience: aud токена должен включать ожидаемый ресурс (если aud задан).
       const auds: string[] = Array.isArray(d.aud) ? d.aud : d.aud ? [d.aud] : [];
@@ -53,7 +60,7 @@ export function makeTokenVerifier(expectedResource: string) {
           try { return checkResourceAllowed({ requestedResource: a, configuredResource: expectedResource }); }
           catch { return a === expectedResource; }
         });
-        if (!allowed) throw new Error("audience mismatch");
+        if (!allowed) throw new InvalidTokenError("Token audience does not match this resource");
       }
 
       const scopes = typeof d.scope === "string" && d.scope ? d.scope.split(/\s+/) : [];

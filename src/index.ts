@@ -82,6 +82,15 @@ app.post("/mcp", authMiddleware, async (req: Request, res: Response) => {
     transport.onclose = () => { if (transport.sessionId) delete transports[transport.sessionId]; };
     const server = createMcpServer();
     await server.connect(transport);
+  } else if (sid) {
+    // Сессия не найдена (рестарт контейнера — транспорты живут в памяти). Спека
+    // Streamable HTTP: на запрос с неизвестным Mcp-Session-Id сервер отвечает 404,
+    // и тогда клиент ОБЯЗАН начать новую сессию новым initialize. Раньше отдавали
+    // 400 — клиент этого сигнала не понимал и продолжал слать мёртвый session-id,
+    // поэтому после каждого деплоя коннектор Claude умирал целиком до ручного
+    // переподключения.
+    res.status(404).json({ jsonrpc: "2.0", error: { code: -32001, message: "Session not found: начните новую сессию (initialize)" }, id: null });
+    return;
   } else {
     res.status(400).json({ jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: нет валидной сессии" }, id: null });
     return;
@@ -91,7 +100,9 @@ app.post("/mcp", authMiddleware, async (req: Request, res: Response) => {
 
 const sessionRequest = async (req: Request, res: Response) => {
   const sid = req.headers["mcp-session-id"] as string | undefined;
-  if (!sid || !transports[sid]) { res.status(400).send("Invalid or missing session ID"); return; }
+  if (!sid) { res.status(400).send("Missing session ID"); return; }
+  // См. выше: неизвестная сессия — 404, чтобы клиент переинициализировался сам.
+  if (!transports[sid]) { res.status(404).send("Session not found"); return; }
   await transports[sid].handleRequest(req, res);
 };
 
