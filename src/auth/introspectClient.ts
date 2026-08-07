@@ -45,7 +45,11 @@ export async function resolveIntrospectCreds(): Promise<IntrospectCreds> {
       try {
         fs.mkdirSync(path.dirname(store), { recursive: true });
         fs.writeFileSync(store, JSON.stringify(creds), { mode: 0o600 });
-      } catch { /* нет volume — переживём, зарегистрируемся снова при рестарте */ }
+      } catch (e: any) {
+        // Пережить можно (зарегистрируемся снова при рестарте), но молчать нельзя:
+        // без кэша каждый рестарт плодит клиента в oauth_clients.
+        console.warn(`[balance-mcp] WARN: кэш introspection-клиента не сохранён в ${store}: ${e?.message || e}`);
+      }
       return creds;
     } catch (e) {
       lastErr = e;

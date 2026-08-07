@@ -46,9 +46,14 @@ export function registerClientFileTools(server: McpServer) {
   server.registerTool("upload_customer_file", {
     title: "Сохранить файл контрагенту",
     description:
-      "Загрузить/сохранить файл в раздел «Файлы контрагента» по customer_id. " +
-      "Передайте имя файла и содержимое в base64. Допустимые типы: pdf, doc(x), xls(x), ppt(x), " +
-      "txt, csv, rtf, odt/ods, изображения, архивы. Скачать потом — get_customer_file по возвращённому file_id.",
+      "Сохранить в «Файлы контрагента» содержимое, которое СОСТАВИЛИ ВЫ САМИ (текст, CSV, сгенерированный " +
+      "документ) — передав его в base64 по customer_id. " +
+      "НЕ ГОДИТСЯ для файла пользователя: вложение в чате и файл на его диске приходят вам как извлечённый " +
+      "текст, а не как байты, поэтому корректный content_base64 вы для них построить не можете — попытка " +
+      "закончится битым файлом. Для файла пользователя — create_customer_upload_link; для файла по " +
+      "http(s)-ссылке — upload_customer_file_from_url. " +
+      "Допустимые типы: pdf, doc(x), xls(x), ppt(x), txt, csv, rtf, odt/ods, изображения, архивы. " +
+      "Скачать потом — get_customer_file по возвращённому file_id.",
     inputSchema: {
       customer_id: z.number().int().positive(),
       filename: z.string().describe("Имя файла с расширением, напр. «акт-2026.pdf»"),
@@ -59,7 +64,16 @@ export function registerClientFileTools(server: McpServer) {
   }, async (a, extra) => {
     const { customer_id, ...body } = a;
     const env = await balanceCall(tokenOf(extra), "POST", `/customers/${customer_id}/files`, body);
-    if (!env.ok) return fail(env.error.message);
+    if (!env.ok) {
+      // Самая частая причина провала — попытка протащить пользовательский файл
+      // через content_base64. Подсказываем рабочий путь прямо в ошибке.
+      return fail(
+        `${env.error.message}\n` +
+        "Если это файл ПОЛЬЗОВАТЕЛЯ (вложение в чате, файл на его диске) — его байты вам недоступны: " +
+        "используйте create_customer_upload_link и отдайте ссылку человеку, либо " +
+        "upload_customer_file_from_url, если файл лежит по публичной http(s)-ссылке."
+      );
+    }
     return ok(`Файл сохранён контрагенту #${customer_id}: #${env.data?.file_id} ${env.data?.name}`, env.data);
   });
 
