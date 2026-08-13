@@ -59,9 +59,11 @@ export async function deliverFile(token: string, path: string, label: string, ex
   }
 
   // Имя в хвосте URL — косметика: браузер и агент понимают по нему тип файла.
-  // Сам файл резолвится только по токену.
+  // Сам файл резолвится только по токену. Слэши из имени убираем ДО кодирования:
+  // Apache по умолчанию (AllowEncodedSlashes off) отвечает 404 на %2F в пути.
   const base = publicBaseOf(extra);
-  const url = `${base}/mcp/file/${dlToken}/${encodeURIComponent(name)}`;
+  const seg = encodeURIComponent(name.replace(/[\\/]+/g, "_"));
+  const url = `${base}/mcp/file/${dlToken}/${seg}`;
 
   let text = `Файл «${name}» — ${humanSize(size)}, ${ctype}.\n`
            + `Ссылка (живёт ${linkTtlMinutes()} мин, откроется в браузере без авторизации): ${url}`;
