@@ -68,12 +68,17 @@ export async function deliverFile(token: string, path: string, label: string, ex
   let text = `Файл «${name}» — ${humanSize(size)}, ${ctype}.\n`
            + `Ссылка (живёт ${linkTtlMinutes()} мин, откроется в браузере без авторизации): ${url}`;
 
+  // Содержимое текстовых файлов кладём и в text, и в structuredContent: разные
+  // клиенты показывают модели разное (Claude Code — structuredContent), а
+  // ходить по ссылке за 2 КБ txt — лишний круг.
+  const structured: Record<string, any> = {
+    name, size_bytes: size, content_type: ctype, url, ttl_minutes: linkTtlMinutes(),
+  };
   if (isTextual(ctype, name) && size <= CFG.textInlineMaxBytes) {
-    text += `\n\nСодержимое:\n${f.buffer.toString("utf8")}`;
+    const body = f.buffer.toString("utf8");
+    text += `\n\nСодержимое:\n${body}`;
+    structured.content = body;
   }
 
-  return {
-    content: [{ type: "text" as const, text }],
-    structuredContent: { name, size_bytes: size, content_type: ctype, url, ttl_minutes: linkTtlMinutes() },
-  };
+  return { content: [{ type: "text" as const, text }], structuredContent: structured };
 }

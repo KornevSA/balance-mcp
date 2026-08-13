@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { balanceCall } from "../balanceClient.js";
 import { deliverFile } from "../fileTransfer.js";
-import { tokenOf, qs, ok, fail } from "./util.js";
+import { tokenOf, qs, ok, fail, publicBaseOf } from "./util.js";
 
 export function registerDocumentTools(server: McpServer) {
   server.registerTool("list_customer_documents", {
@@ -42,6 +42,39 @@ export function registerDocumentTools(server: McpServer) {
     inputSchema: { doc_id: z.number().int().positive() },
   }, async (a, extra) => {
     return await deliverFile(tokenOf(extra), `/documents/${a.doc_id}/file`, `Документ ${a.doc_id}.pdf`, extra);
+  });
+
+  server.registerTool("get_document_share_link", {
+    title: "Постоянная ссылка на документ",
+    description:
+      "Выдать ПОСТОЯННУЮ публичную ссылку на документ — её можно отправить клиенту: она работает " +
+      "без авторизации, пока её не отозвали (revoke_document_share_link). Этим она отличается от " +
+      "get_document_pdf, чья ссылка живёт 30 минут и годится только чтобы посмотреть самому. " +
+      "Ссылка одна на документ: повторный вызов вернёт ту же и снимет отзыв, а не создаст новую. " +
+      "Открывается в браузере; чтобы принудительно скачать — добавить к URL «&download=1».",
+    inputSchema: { doc_id: z.number().int().positive() },
+  }, async (a, extra) => {
+    const env = await balanceCall(tokenOf(extra), "POST", `/documents/${a.doc_id}/share-link`);
+    if (!env.ok) return fail(env.error.message);
+    const url = publicBaseOf(extra) + String(env.data?.path || "");
+    return ok(
+      `Постоянная публичная ссылка на «${env.data?.filename || `документ #${a.doc_id}`}» — ` +
+      `отдайте её клиенту:\n${url}`,
+      { ...env.data, url },
+    );
+  });
+
+  server.registerTool("revoke_document_share_link", {
+    title: "Отозвать ссылку на документ",
+    description:
+      "Отозвать публичную ссылку документа (выданную get_document_share_link или из интерфейса): " +
+      "по ней сразу перестанет открываться. Токен сохраняется — если позже выдать ссылку снова, " +
+      "это будет ТОТ ЖЕ адрес, и старая рассылка оживёт.",
+    inputSchema: { doc_id: z.number().int().positive() },
+  }, async (a, extra) => {
+    const env = await balanceCall(tokenOf(extra), "DELETE", `/documents/${a.doc_id}/share-link`);
+    if (!env.ok) return fail(env.error.message);
+    return ok(`Публичная ссылка на документ #${a.doc_id} отозвана.`, env.data);
   });
 
   server.registerTool("search_documents", {
