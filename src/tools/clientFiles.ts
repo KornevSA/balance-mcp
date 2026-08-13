@@ -37,10 +37,13 @@ export function registerClientFileTools(server: McpServer) {
 
   server.registerTool("get_customer_file", {
     title: "Скачать файл контрагента",
-    description: "Скачать файл контрагента по file_id (из list_customer_files). Небольшие — инлайном.",
+    description:
+      "Получить файл контрагента по file_id (из list_customer_files). Возвращает ВРЕМЕННУЮ ссылку " +
+      "(30 минут), по которой файл открывается/скачивается в браузере — её можно отдать человеку " +
+      "или скачать самому. Текстовые файлы дополнительно приходят содержимым.",
     inputSchema: { file_id: z.number().int().positive() },
   }, async (a, extra) => {
-    return await deliverFile(tokenOf(extra), `/files/${a.file_id}/content`, `file_${a.file_id}`);
+    return await deliverFile(tokenOf(extra), `/files/${a.file_id}/content`, `file_${a.file_id}`, extra);
   });
 
   server.registerTool("upload_customer_file", {

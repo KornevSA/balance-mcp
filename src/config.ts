@@ -27,6 +27,17 @@ export const CFG = {
   // Порог инлайна файла (base64) в ответе тулза.
   inlineMaxBytes: parseInt(process.env.MCP_INLINE_MAX_BYTES || String(5 * 1024 * 1024), 10),
 
+  // Временные ссылки на файлы (`/mcp/file/<token>`), см. downloadStore.ts.
+  // TTL — сколько живёт ссылка; linkMaxBytes — потолок одного файла;
+  // linkStoreMaxBytes — общий потолок памяти под все живые ссылки.
+  linkTtlMs: parseInt(process.env.MCP_LINK_TTL_MIN || "30", 10) * 60 * 1000,
+  linkMaxBytes: parseInt(process.env.MCP_LINK_MAX_BYTES || String(64 * 1024 * 1024), 10),
+  linkStoreMaxBytes: parseInt(process.env.MCP_LINK_STORE_MAX_BYTES || String(256 * 1024 * 1024), 10),
+
+  // Текстовые файлы (txt/csv/json/xml) не крупнее этого отдаём ещё и текстом в
+  // ответе тулза — модель читает содержимое без похода по ссылке.
+  textInlineMaxBytes: parseInt(process.env.MCP_TEXT_INLINE_MAX_BYTES || String(32 * 1024), 10),
+
   // DaData (ЕГРЮЛ) — авто-резолв наименования/реквизитов контрагента по ИНН.
   // Пустой токен = резолвер выключен (find_or_create_customer требует name).
   dadataToken: process.env.DADATA_TOKEN || "",

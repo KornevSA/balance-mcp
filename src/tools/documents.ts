@@ -36,10 +36,12 @@ export function registerDocumentTools(server: McpServer) {
 
   server.registerTool("get_document_pdf", {
     title: "PDF документа",
-    description: "Скачать PDF документа (счёт/акт и т.п.) по doc_id. Небольшие файлы вкладываются инлайном.",
+    description:
+      "Получить PDF документа (счёт/акт и т.п.) по doc_id. Возвращает ВРЕМЕННУЮ ссылку (30 минут), " +
+      "по которой PDF открывается в браузере — её можно отдать человеку или скачать файл самому.",
     inputSchema: { doc_id: z.number().int().positive() },
   }, async (a, extra) => {
-    return await deliverFile(tokenOf(extra), `/documents/${a.doc_id}/file`, `Документ ${a.doc_id}.pdf`);
+    return await deliverFile(tokenOf(extra), `/documents/${a.doc_id}/file`, `Документ ${a.doc_id}.pdf`, extra);
   });
 
   server.registerTool("search_documents", {

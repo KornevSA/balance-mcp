@@ -17,10 +17,12 @@ export function registerMyFileTools(server: McpServer) {
 
   server.registerTool("get_my_file", {
     title: "Скачать мой файл",
-    description: "Скачать ваш личный файл по id (из list_my_files). Небольшие — инлайном.",
+    description:
+      "Получить ваш личный файл по id (из list_my_files). Возвращает ВРЕМЕННУЮ ссылку (30 минут), " +
+      "по которой файл открывается/скачивается в браузере. Текстовые файлы приходят и содержимым.",
     inputSchema: { id: z.number().int().positive() },
   }, async (a, extra) => {
-    return await deliverFile(tokenOf(extra), `/me/files/${a.id}/content`, `my_file_${a.id}`);
+    return await deliverFile(tokenOf(extra), `/me/files/${a.id}/content`, `my_file_${a.id}`, extra);
   });
 
   server.registerTool("upload_my_file", {

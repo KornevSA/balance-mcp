@@ -10,6 +10,7 @@ import { SCOPES_SUPPORTED } from "./auth/metadata.js";
 import { makeTokenVerifier, setIntrospectCreds } from "./auth/tokenVerifier.js";
 import { resolveIntrospectCreds } from "./auth/introspectClient.js";
 import { createMcpServer } from "./server.js";
+import { getDownload } from "./downloadStore.js";
 
 const app = express();
 
@@ -21,6 +22,33 @@ app.use(cors({
 
 // Health (без авторизации) — для docker healthcheck.
 app.get("/healthz", (_req, res) => { res.json({ ok: true, service: "balance-mcp" }); });
+
+// Временная ссылка на файл: `/mcp/file/<token>[/<имя>]`. Авторизации нет —
+// ключ доступа сам токен (192 бита, TTL, только в памяти; см. downloadStore.ts).
+// Имя в хвосте пути косметическое, файл резолвится только по токену.
+//
+// Инлайн в браузере разрешаем ТОЛЬКО безопасным типам: этот путь живёт на
+// origin самого balance (Apache проксирует /mcp), поэтому html/svg инлайном
+// были бы stored-XSS с доступом к сессии приложения. Всё остальное — attachment
+// и octet-stream.
+const INLINE_TYPES = /^(application\/pdf|image\/(png|jpeg|gif|webp)|text\/plain|text\/csv)/i;
+
+app.get("/mcp/file/:token/:name?", (req: Request, res: Response) => {
+  const entry = getDownload(String(req.params.token || ""));
+  if (!entry) { res.status(404).type("text/plain; charset=utf-8").send("Ссылка не найдена или истекла"); return; }
+
+  const inline = INLINE_TYPES.test(entry.ctype);
+  const ascii = entry.name.replace(/[^\x20-\x7E]/g, "_").replace(/["\\]/g, "_") || "file";
+  res.setHeader("Content-Type", inline ? entry.ctype : "application/octet-stream");
+  res.setHeader("Content-Length", String(entry.buf.length));
+  res.setHeader(
+    "Content-Disposition",
+    `${inline ? "inline" : "attachment"}; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(entry.name)}`,
+  );
+  res.setHeader("Cache-Control", "private, no-store");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.end(entry.buf);
+});
 
 // Канонический публичный базовый URL вычисляем ИЗ ЗАПРОСА (как PHP-AS balance),
 // а не из ENV — тогда коннектор работает на любом домене без прод-конфига и не
