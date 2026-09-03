@@ -118,8 +118,8 @@ export function registerDocumentTools(server: McpServer) {
   server.registerTool("documents_summary", {
     title: "Сводка по документам за период",
     description:
-      "Агрегаты SUM/COUNT по типам документов за период (+ дебет action1 / кредит action2 / net). " +
-      "Помогает заметить странности (например, только дебет без кредита).",
+      "Агрегаты SUM/COUNT по типам документов за период: поступления action1, реализации action2, net. " +
+      "Помогает заметить странности (например, реализации есть, а поступлений нет).",
     inputSchema: {
       from: z.string().optional(), to: z.string().optional(),
       type_ids: z.array(z.number()).optional(),
