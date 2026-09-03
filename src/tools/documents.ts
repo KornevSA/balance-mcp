@@ -26,7 +26,9 @@ export function registerDocumentTools(server: McpServer) {
 
   server.registerTool("get_document", {
     title: "Метаданные документа",
-    description: "Получить метаданные документа по doc_id (+ инфо из 1С, если есть).",
+    description:
+      "Получить метаданные документа по doc_id (+ инфо из 1С, если есть, и список вложений " +
+      "в поле attachments — отчёты и сканы, привязанные к документу).",
     inputSchema: { doc_id: z.number().int().positive() },
   }, async (a, extra) => {
     const env = await balanceCall(tokenOf(extra), "GET", `/documents/${a.doc_id}`);
@@ -131,5 +133,67 @@ export function registerDocumentTools(server: McpServer) {
     if (!env.ok) return fail(env.error.message);
     const t = env.data?.totals;
     return ok(`Документов: ${t?.count ?? 0}, поступления ${t?.payments_action1 ?? 0}, реализации ${t?.realizations_action2 ?? 0}, net ${t?.net ?? 0}`, env.data);
+  });
+
+  // ---- вложения к документу (таблица doc_files, миграция 114) ----------------
+  // Файл принадлежит КОНТРАГЕНТУ (files), к документу его привязывает отдельная
+  // связь. Отсюда порядок действий: сначала файл появляется у контрагента
+  // (upload_customer_file / upload_customer_file_from_url / create_customer_upload_link),
+  // потом attach_file_to_document. Одного файла хватает на несколько документов —
+  // отчёт за период прикрепляется и к счёту, и к УПД, не задваиваясь на диске.
+
+  server.registerTool("list_document_files", {
+    title: "Вложения документа",
+    description:
+      "Файлы, прикреплённые к документу (отчёт к УПД, скан подписанного экземпляра, приложение). " +
+      "Это НЕ сам документ: PDF счёта/акта берётся через get_document_pdf. " +
+      "Скачать вложение — get_customer_file по его file_id. " +
+      "doc_count в ответе показывает, к скольким документам привязан тот же файл.",
+    inputSchema: { doc_id: z.number().int().positive() },
+  }, async (a, extra) => {
+    const env = await balanceCall(tokenOf(extra), "GET", `/documents/${a.doc_id}/files`);
+    if (!env.ok) return fail(env.error.message);
+    return ok(`Вложений у документа #${a.doc_id}: ${env.data?.total ?? 0}`, env.data);
+  });
+
+  server.registerTool("attach_file_to_document", {
+    title: "Прикрепить файл к документу",
+    description:
+      "Привязать УЖЕ ЗАГРУЖЕННЫЙ файл контрагента к его документу — например отчёт-детализацию к УПД. " +
+      "file_id берётся из list_customer_files (или из ответа upload_customer_file). Файл обязан " +
+      "принадлежать тому же контрагенту, что и документ. " +
+      "Байты сюда не передаются: сначала загрузите файл контрагенту (upload_customer_file, " +
+      "upload_customer_file_from_url или create_customer_upload_link), потом прикрепите. " +
+      "Один файл можно прикрепить к нескольким документам — вызовите инструмент для каждого " +
+      "(отчёт за период обычно относится и к счёту, и к акту). " +
+      "kind — смысл вложения: report (отчёт/детализация), signed_scan (подписанный экземпляр), " +
+      "annex (прочее приложение, по умолчанию). Вложения сейчас ВНУТРЕННИЕ: клиенту они " +
+      "автоматически не показываются и в письмо с документом не уходят.",
+    inputSchema: {
+      doc_id: z.number().int().positive(),
+      file_id: z.number().int().positive().describe("Файл контрагента из list_customer_files"),
+      kind: z.enum(["report", "signed_scan", "annex"]).optional(),
+    },
+  }, async (a, extra) => {
+    const { doc_id, ...body } = a;
+    const env = await balanceCall(tokenOf(extra), "POST", `/documents/${doc_id}/files`, body);
+    if (!env.ok) return fail(env.error.message);
+    return ok(`Файл #${a.file_id} прикреплён к документу #${doc_id} (${env.data?.kind ?? "annex"})`, env.data);
+  });
+
+  server.registerTool("detach_file_from_document", {
+    title: "Открепить файл от документа",
+    description:
+      "Снять вложение С ЭТОГО документа. Файл при этом НЕ удаляется: он остаётся в файлах " +
+      "контрагента и на других документах, к которым привязан (проверить — list_document_files, " +
+      "поле doc_count). Удаления файла насовсем в MCP нет намеренно — это делает человек в карточке.",
+    inputSchema: {
+      doc_id: z.number().int().positive(),
+      file_id: z.number().int().positive(),
+    },
+  }, async (a, extra) => {
+    const env = await balanceCall(tokenOf(extra), "DELETE", `/documents/${a.doc_id}/files/${a.file_id}`);
+    if (!env.ok) return fail(env.error.message);
+    return ok(`Файл #${a.file_id} откреплён от документа #${a.doc_id}`, env.data);
   });
 }

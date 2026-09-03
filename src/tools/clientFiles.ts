@@ -160,4 +160,24 @@ export function registerClientFileTools(server: McpServer) {
       { ...env.data, url }
     );
   });
+
+  server.registerTool("rename_customer_file", {
+    title: "Переименовать файл контрагента",
+    description:
+      "Изменить ОТОБРАЖАЕМОЕ имя файла контрагента (file_id из list_customer_files, " +
+      "list_document_files или ответа upload_customer_file). Само содержимое и ссылка на " +
+      "скачивание не меняются. " +
+      "Имя общее: один файл может быть виден и в «Файлах контрагента», и сразу на нескольких " +
+      "документах, к которым он прикреплён, — новое имя увидят везде. " +
+      "Годится, чтобы дать осмысленное название отчёту или скану вместо имени из формы загрузки. " +
+      "Длиннее 300 символов обрезается.",
+    inputSchema: {
+      file_id: z.number().int().positive(),
+      name: z.string().min(1).describe("Новое отображаемое имя, напр. «Детализация к УПД за август 2026»"),
+    },
+  }, async (a, extra) => {
+    const env = await balanceCall(tokenOf(extra), "PATCH", `/files/${a.file_id}`, { document_name: a.name });
+    if (!env.ok) return fail(env.error.message);
+    return ok(`Файл #${a.file_id} переименован: ${env.data?.document_name}`, env.data);
+  });
 }
