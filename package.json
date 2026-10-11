@@ -8,7 +8,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsc -w"
+    "dev": "tsc -w",
+    "test": "tsc -p tsconfig.test.json && node --test build-test/test/"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.18.0",

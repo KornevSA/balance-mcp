@@ -2,7 +2,8 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { balanceCall } from "../balanceClient.js";
 import { tokenOf, qs, ok, fail } from "./util.js";
-import { lookupCompanyByInn, preferredName, dadataEnabled } from "../dadata.js";
+import { preferredName } from "../dadata.js";
+import { lookupRegistry } from "../registry.js";
 
 export function registerCustomerTools(server: McpServer) {
   server.registerTool("search_customers", {
@@ -38,8 +39,9 @@ export function registerCustomerTools(server: McpServer) {
     title: "Найти или создать контрагента",
     description:
       "Идемпотентно по ИНН: если КА с таким ИНН есть — вернёт его (existing=true), иначе создаст. " +
-      "Название (name) НЕ обязательно при наличии inn — оно подтянется из ЕГРЮЛ (DaData) " +
-      "вместе с КПП, юр.адресом и руководителем. Передайте name явно, чтобы задать своё. " +
+      "Название (name) НЕ обязательно при наличии inn — оно подтянется из ЕГРЮЛ/ЕГРИП (через сервис " +
+      "1С:Контрагент; если реестр 1С недоступен — запасной DaData) вместе с КПП, юр.адресом и руководителем. " +
+      "Передайте name явно, чтобы задать своё. " +
       "Для привязки к кабинету дилера передайте remote_id вместе с customer_group_id.",
     inputSchema: {
       name: z.string().optional().describe("Название КА. Необязательно при наличии inn — возьмём из ЕГРЮЛ"),
@@ -60,17 +62,23 @@ export function registerCustomerTools(server: McpServer) {
       }
     }
 
-    // 2) Создаём. Если название не передали — резолвим его по ИНН из ЕГРЮЛ (DaData)
-    //    и заодно подтягиваем КПП/юр.адрес/руководителя (поля whitelisted в balance).
+    // 2) Создаём. Если название не передали — резолвим его по ИНН из ЕГРЮЛ/ЕГРИП (через 1С:Контрагент,
+    //    запасной — DaData) и заодно подтягиваем КПП/юр.адрес/руководителя (поля whitelisted в balance).
     const body: any = {};
     let name = (a.name ?? "").trim();
     let nameNote = "";
+    let regWarn = "";
     if (!name && a.inn) {
-      const info = await lookupCompanyByInn(a.inn);
-      const resolved = info ? preferredName(info) : undefined;
-      if (info && resolved) {
+      const r = await lookupRegistry(token, a.inn);
+      if (!r.ok) return fail(`${r.message}. Проверьте ИНН или передайте name явно.`);
+      const info = r.info;
+      const resolved = preferredName(info);
+      if (resolved) {
         name = resolved;
-        nameNote = " (реквизиты из ЕГРЮЛ по ИНН)";
+        nameNote = info.source === "1c"
+          ? " (реквизиты из ЕГРЮЛ/ЕГРИП через 1С)"
+          : ` (реквизиты из ЕГРЮЛ через DaData — реестр 1С недоступен: ${info.fallback_reason})`;
+        if (!info.active) regWarn = ` ⚠ в реестре: ${info.status_name || "не действует"}${info.termination_date ? `, прекращена ${info.termination_date}` : ""}`;
         if (info.kpp)           body.kpp = info.kpp;
         if (info.address)       body.urpost = info.address;
         if (info.director)      body.official = info.director;
@@ -80,9 +88,7 @@ export function registerCustomerTools(server: McpServer) {
     if (!name) {
       return fail(
         a.inn
-          ? (dadataEnabled()
-              ? `По ИНН ${a.inn} в ЕГРЮЛ ничего не найдено — проверьте ИНН или передайте name явно.`
-              : `Нужно название (name): авто-резолв по ИНН выключен (не задан DADATA_TOKEN).`)
+          ? `По ИНН ${a.inn} в реестре нет наименования — передайте name явно.`
           : "Для создания контрагента нужно название (name) либо ИНН (inn) для авто-резолва из ЕГРЮЛ."
       );
     }
@@ -95,7 +101,7 @@ export function registerCustomerTools(server: McpServer) {
 
     const created = await balanceCall(token, "POST", "/customers", body);
     if (!created.ok) return fail(created.error.message);
-    return ok(`Контрагент создан: #${created.data?.customer_id}${nameNote} — ${name}`, created.data);
+    return ok(`Контрагент создан: #${created.data?.customer_id}${nameNote} — ${name}${regWarn}`, created.data);
   });
 
   server.registerTool("update_customer", {
@@ -138,21 +144,23 @@ export function registerCustomerTools(server: McpServer) {
   });
 
   server.registerTool("lookup_company_by_inn", {
-    title: "Реквизиты по ИНН (ЕГРЮЛ)",
+    title: "Реквизиты по ИНН (ЕГРЮЛ/ЕГРИП)",
     description:
-      "Определить наименование и реквизиты организации/ИП по ИНН из ЕГРЮЛ (DaData), " +
-      "НЕ создавая контрагента. Используйте, чтобы подставить/подтвердить название перед " +
-      "созданием КА и выставлением счёта. Возвращает name_short, name_full, kpp, ogrn, " +
-      "адрес, руководителя и статус (ACTIVE / ликвидирована и т.п.).",
+      "Определить наименование и реквизиты организации/ИП по ИНН из ЕГРЮЛ/ЕГРИП (сервис 1С:Контрагент " +
+      "через базы 1С; если реестр 1С недоступен — запасной DaData, если настроен), НЕ создавая контрагента. " +
+      "Используйте, чтобы подставить/подтвердить название перед созданием КА и выставлением счёта. Возвращает " +
+      "name_short, name_full, kpp, ogrn, адрес, руководителя, статус и active (действует ли), source (1c | dadata). " +
+      "Историю наименований, КПП и адресов даёт lookup_onec_registry.",
     inputSchema: {
       inn: z.string().describe("ИНН: 10 цифр — юрлицо, 12 — ИП"),
     },
-  }, async (a) => {
-    if (!dadataEnabled()) return fail("Резолвер ЕГРЮЛ (DaData) не настроен: задайте DADATA_TOKEN.");
-    const info = await lookupCompanyByInn(a.inn);
-    if (!info) return fail(`По ИНН ${a.inn} ничего не найдено в ЕГРЮЛ (проверьте корректность ИНН).`);
+  }, async (a, extra) => {
+    const r = await lookupRegistry(tokenOf(extra), a.inn);
+    if (!r.ok) return fail(r.message);
+    const info = r.info;
     const title = preferredName(info) || `ИНН ${info.inn}`;
-    const warn = info.status && info.status !== "ACTIVE" ? ` ⚠ статус: ${info.status}` : "";
-    return ok(`${title}${warn}`, info);
+    const warn = !info.active ? ` ⚠ статус: ${info.status_name || info.status || "не действует"}${info.termination_date ? `, прекращена ${info.termination_date}` : ""}` : "";
+    const src = info.source === "1c" ? "ЕГРЮЛ/ЕГРИП через 1С" : `DaData (реестр 1С недоступен: ${info.fallback_reason})`;
+    return ok(`${title}${warn} — источник: ${src}`, info);
   });
 }
