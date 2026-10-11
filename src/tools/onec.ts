@@ -1,4 +1,4 @@
-// Тулзы 1С — ТОЛЬКО ЧТЕНИЕ (этапы 1–2 проекта docs/onec-api-design.md).
+// Тулзы 1С — ЧТЕНИЕ (этапы 1–2 проекта docs/onec-api-design.md). Запись (этапы 3–5) — onecWrite.ts.
 //
 // MCP в 1С не ходит: каждый тулз зовёт balance /api/v1 (/onec/…, /customers/{id}/onec,
 // /documents/{id}/onec), а balance сам выбирает базу 1С по org_id, проверяет скоуп onec:read,
@@ -13,11 +13,11 @@ import { CFG } from "../config.js";
 import { putDownload, linkTtlMinutes } from "../downloadStore.js";
 import { tokenOf, qs, ok, fail, publicBaseOf } from "./util.js";
 
-const ONEC_TIMEOUT_MS = 120_000;
+export const ONEC_TIMEOUT_MS = 120_000;
 const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const KINDS = [
   "sale", "sale_return", "sale_correction", "invoice", "vat_invoice", "purchase",
   "bank_in", "bank_out", "cash_in", "cash_out", "card_payment", "reconciliation",
@@ -35,7 +35,7 @@ function get(extra: any, path: string): Promise<Envelope> {
 }
 
 /** Ошибка balance/1С для модели: текст + код + request_id (+ кандидаты, если balance их вернул). */
-function onecFail(env: any) {
+export function onecFail(env: any) {
   const e = env?.error || {};
   let t = String(e.message || "Ошибка");
   if (e.code) t += ` [${e.code}]`;
@@ -47,12 +47,12 @@ function onecFail(env: any) {
   return fail(t);
 }
 
-function money(v: any): string {
+export function money(v: any): string {
   const n = Number(v);
   return Number.isFinite(n) ? n.toLocaleString("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : String(v ?? "—");
 }
 
-function docLine(d: any): string {
+export function docLine(d: any): string {
   if (!d) return "";
   const flags = [d.posted === false ? "не проведён" : "", d.deleted ? "помечен на удаление" : ""].filter(Boolean).join(", ");
   return `${d.kind_name || d.kind || "документ"} № ${d.number ?? "—"} от ${String(d.date ?? "").slice(0, 10)} на ${money(d.amount)}` +
@@ -113,7 +113,9 @@ export function registerOneCTools(server: McpServer) {
     description:
       "Базы 1С по организациям: для каждой org_id — подключено ли API 1С (ready / v1_state=ok), когда проверялось, " +
       "имя публикации и версия API. Вызывайте первым, чтобы выбрать org_id для остальных тулзов 1С. " +
-      "Одна организация — одна база 1С (ИП Корнев, Интер, НотиСенд). Все тулзы *_onec_* только читают 1С.",
+      "Одна организация — одна база 1С (ИП Корнев, Интер, НотиСенд). Тулзы get/list/search/lookup_onec_* только читают 1С; " +
+      "запись — отдельные тулзы с подтверждением (create_onec_*, fill_onec_*, send_document_to_onec, pull_onec_bank_payments, " +
+      "set_onec_document_state).",
     inputSchema: {},
     annotations: READ_ONLY,
   }, async (_a, extra) => {

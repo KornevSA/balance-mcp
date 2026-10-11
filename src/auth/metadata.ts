@@ -18,6 +18,7 @@ export const SCOPES_SUPPORTED = [
   "tasks:write",
   "users:read",
   "onec:read",
+  "onec:write",
 ];
 
 // Метаданные Authorization Server (balance). Публикуем ТОЛЬКО публичные URL —

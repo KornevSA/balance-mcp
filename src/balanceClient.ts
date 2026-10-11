@@ -9,17 +9,21 @@ export type Envelope<T = any> =
  * Необязательные параметры вызова. timeoutMs — сколько ждать ответа balance
  * (по умолчанию без ограничения, как раньше). Тулзы 1С ставят 120 с: холодная
  * база 1С отвечает десятки секунд, а balance сам ограничивает каждый вызов 1С.
+ * write — вызов что-то записывает (тулзы записи в 1С): на обрыв другой текст —
+ * запись могла пройти, повтор безопасен только потому, что ключи записи постоянные.
  */
-export type CallOpts = { timeoutMs?: number };
+export type CallOpts = { timeoutMs?: number; write?: boolean };
 
 function isTimeout(e: any): boolean {
   const n = String(e?.name || "");
   return n === "TimeoutError" || n === "AbortError";
 }
 
-function timeoutMessage(ms: number): string {
+function timeoutMessage(ms: number, write = false): string {
   return `balance не ответил за ${Math.round(ms / 1000)} с (1С отвечает долго: холодный старт базы или блокировка). ` +
-    `Повтор безопасен — это только чтение.`;
+    (write
+      ? `Запись могла пройти. Повтор безопасен (ключ записи тот же — 1С вернёт уже созданное), но сначала посмотрите результат в 1С.`
+      : `Повтор безопасен — это только чтение.`);
 }
 
 export async function balanceCall<T = any>(
@@ -44,7 +48,7 @@ export async function balanceCall<T = any>(
     text = await r.text();
   } catch (e: any) {
     if (opts.timeoutMs && isTimeout(e)) {
-      return { ok: false, error: { code: "timeout", message: timeoutMessage(opts.timeoutMs) } };
+      return { ok: false, error: { code: "timeout", message: timeoutMessage(opts.timeoutMs, opts.write) } };
     }
     return { ok: false, error: { code: "network", message: String(e?.message || e) } };
   }

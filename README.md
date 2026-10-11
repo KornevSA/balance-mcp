@@ -11,8 +11,8 @@ TypeScript + `@modelcontextprotocol/sdk`, транспорт **streamable HTTP**
 
 | Tool | Назначение |
 |---|---|
-| `find_or_create_customer`, `search_customers`, `get_customer` | контрагенты (идемпотентно по ИНН; `name` необязателен — тянется из ЕГРЮЛ по ИНН) |
-| `lookup_company_by_inn` | реквизиты юрлица/ИП по ИНН из ЕГРЮЛ (DaData), без создания КА |
+| `find_or_create_customer`, `search_customers`, `get_customer` | контрагенты (идемпотентно по ИНН; `name` необязателен — тянется из ЕГРЮЛ/ЕГРИП по ИНН) |
+| `lookup_company_by_inn` | реквизиты юрлица/ИП по ИНН из ЕГРЮЛ/ЕГРИП через 1С:Контрагент (запасной — DaData), без создания КА |
 | `create_invoice` | выставить счёт (+PDF через `get_document_pdf`) |
 | `list_customer_documents`, `get_document`, `get_document_pdf` | документы и их PDF |
 | `search_documents`, `documents_summary` | **кросс-КА поиск за период** (стр./полностью) и сводка |
@@ -25,15 +25,35 @@ TypeScript + `@modelcontextprotocol/sdk`, транспорт **streamable HTTP**
 | `list_onec_documents`, `get_onec_document` | документы 1С (по контрагенту или за период ≤ 92 дней), документ balance ↔ 1С со сверкой |
 | `list_onec_contracts`, `get_onec_contract`, `search_onec_nomenclature`, `lookup_onec_registry` | договоры и номенклатура 1С, ЕГРЮЛ/ЕГРИП через 1С:Контрагент |
 | `get_onec_document_history`, `list_onec_print_forms`, `get_onec_document_pdf` | история изменений, печатные формы и PDF «как в 1С» (ссылкой; в balance не сохраняется) |
+| `create_onec_reconciliation` | **1С, запись с подтверждением**: акт сверки за период (создать или перезаполнить; провести — только по просьбе) + PDF ссылкой |
+| `fill_onec_counterparty_from_registry`, `create_onec_counterparty`, `create_onec_contract` | контрагент 1С по ЕГРЮЛ/ЕГРИП; клиент balance → контрагент 1С; договор balance → договор 1С |
+| `send_document_to_onec`, `pull_onec_bank_payments` | штатные выгрузки balance: документ в 1С тем же путём, что кнопка; «Запросить оплаты из 1С» |
+| `set_onec_document_state` | провести / распровести / пометить на удаление / снять пометку — только документы, созданные balance |
 
 ### Тулзы 1С
 
 MCP в 1С не ходит: тулзы зовут balance `/api/v1/onec/…`, `/customers/{id}/onec`, `/documents/{id}/onec`,
-а balance выбирает базу 1С по `org_id` (только с проверенным API v1), проверяет скоуп `onec:read`, право
-`onec.view` и зону видимости, пишет журнал `onec_audit_log` (`trigger_source = mcp`, `request_id`). Запись в 1С
-на этих этапах не делается вообще. Тайм-аут вызова balance у тулзов 1С — 120 с (холодная база 1С). Новый скоуп
-получает только переподключённый коннектор (миграция balance 156 добавляет `onec:read` зарегистрированным
-клиентам). Проект — `docs/onec-api-design.md` (ветка `onec-api-design`).
+`/contracts/{id}/onec`, а balance выбирает базу 1С по `org_id` (только с проверенным API v1), проверяет скоуп,
+право и зону видимости, пишет журнал `onec_audit_log` (`trigger_source = mcp`, `request_id`; хранится 30 дней).
+Чтение — скоуп `onec:read`, право `onec.view`. Тайм-аут вызова balance у тулзов 1С — 120 с (холодная база 1С).
+
+**Запись** (`src/tools/onecWrite.ts`) — скоуп `onec:write`, права `onec.write` (акт сверки, ЕГРЮЛ, контрагент,
+договор), `onec.export` (отправка документа, загрузка поступлений), `onec.documents` (проведение и пометка); только
+пользователь OAuth, только организации из `onec_api_write_orgs` balance. Каждый тулз записи — **два шага**: без
+`confirm` balance делает `dry_run` (в 1С ничего не пишется) и тулз возвращает превью и токен; запись — повторным
+вызовом с теми же полями и `confirm` (токен — HMAC от операции и полей, 15 минут, как у базы знаний). Где делать
+нечего или нельзя — токена нет. Документы в 1С уходят только штатными механизмами balance (тот же ключ, без дублей);
+проводить и помечать можно только документы, созданные balance. На обрыв по тайм-ауту — текст «запись могла пройти,
+повтор безопасен»: ключи записи постоянные.
+
+Новые скоупы получает только переподключённый коннектор (миграции balance 156 и 157 добавляют `onec:read` и
+`onec:write` зарегистрированным клиентам). Проект — `docs/onec-api-design.md` (ветка `onec-api-design`).
+
+ЕГРЮЛ/ЕГРИП для `lookup_company_by_inn` и `find_or_create_customer` — через сервис 1С:Контрагент баз 1С
+(`src/registry.ts`, balance `GET /onec/registry/{inn}`, кэш 24 ч; нужен скоуп `onec:read`). DaData — только запасной
+вариант, если реестр 1С недоступен и задан `DADATA_TOKEN`.
+
+Тесты: `npm test` (node:test, без зависимостей: подменный balance и перехват обработчиков тулзов).
 
 ### Файлы отдаются ссылкой, а не байтами
 
