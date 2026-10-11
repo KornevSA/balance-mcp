@@ -20,6 +20,20 @@ TypeScript + `@modelcontextprotocol/sdk`, транспорт **streamable HTTP**
 | `find_missing_acts` | **детектор забытых актов** на конец месяца |
 | `list_customer_files`, `get_customer_file` | файлы контрагента |
 | `list_my_files`, `get_my_file`, `upload_my_file` | личные «Мои файлы» |
+| `list_onec_bases`, `get_onec_meta` | **1С (только чтение)**: базы по организациям (`org_id`), справочники базы |
+| `search_onec_counterparties`, `get_onec_counterparty`, `get_onec_settlement` | контрагенты 1С (в том числе по `customer_id` balance) и сальдо 60/62/76 по данным бухгалтерии |
+| `list_onec_documents`, `get_onec_document` | документы 1С (по контрагенту или за период ≤ 92 дней), документ balance ↔ 1С со сверкой |
+| `list_onec_contracts`, `get_onec_contract`, `search_onec_nomenclature`, `lookup_onec_registry` | договоры и номенклатура 1С, ЕГРЮЛ/ЕГРИП через 1С:Контрагент |
+| `get_onec_document_history`, `list_onec_print_forms`, `get_onec_document_pdf` | история изменений, печатные формы и PDF «как в 1С» (ссылкой; в balance не сохраняется) |
+
+### Тулзы 1С
+
+MCP в 1С не ходит: тулзы зовут balance `/api/v1/onec/…`, `/customers/{id}/onec`, `/documents/{id}/onec`,
+а balance выбирает базу 1С по `org_id` (только с проверенным API v1), проверяет скоуп `onec:read`, право
+`onec.view` и зону видимости, пишет журнал `onec_audit_log` (`trigger_source = mcp`, `request_id`). Запись в 1С
+на этих этапах не делается вообще. Тайм-аут вызова balance у тулзов 1С — 120 с (холодная база 1С). Новый скоуп
+получает только переподключённый коннектор (миграция balance 156 добавляет `onec:read` зарегистрированным
+клиентам). Проект — `docs/onec-api-design.md` (ветка `onec-api-design`).
 
 ### Файлы отдаются ссылкой, а не байтами
 
