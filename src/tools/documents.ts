@@ -57,7 +57,9 @@ export function registerDocumentTools(server: McpServer) {
       "без авторизации, пока её не отозвали (revoke_document_share_link). Этим она отличается от " +
       "get_document_pdf, чья ссылка живёт 30 минут и годится только чтобы посмотреть самому. " +
       "Ссылка одна на документ: повторный вызов вернёт ту же и снимет отзыв, а не создаст новую. " +
-      "Открывается в браузере; чтобы принудительно скачать — добавить к URL «&download=1».",
+      "Открывается в браузере; чтобы принудительно скачать — добавить к URL «&download=1». " +
+      "Нужно отдельное согласие documents:share: ответ «Токену не выдан scope: documents:share» " +
+      "значит, что коннектор подключён до его появления — пользователю надо переподключить коннектор.",
     inputSchema: { doc_id: z.number().int().positive() },
   }, async (a, extra) => {
     const env = await balanceCall(tokenOf(extra), "POST", `/documents/${a.doc_id}/share-link`);
