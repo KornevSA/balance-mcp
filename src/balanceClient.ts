@@ -3,15 +3,34 @@ import { CFG } from "./config.js";
 
 export type Envelope<T = any> =
   | { ok: true; data: T }
-  | { ok: false; error: { code: string; message: string } };
+  | { ok: false; error: { code: string; message: string; [k: string]: any } };
+
+/**
+ * Необязательные параметры вызова. timeoutMs — сколько ждать ответа balance
+ * (по умолчанию без ограничения, как раньше). Тулзы 1С ставят 120 с: холодная
+ * база 1С отвечает десятки секунд, а balance сам ограничивает каждый вызов 1С.
+ */
+export type CallOpts = { timeoutMs?: number };
+
+function isTimeout(e: any): boolean {
+  const n = String(e?.name || "");
+  return n === "TimeoutError" || n === "AbortError";
+}
+
+function timeoutMessage(ms: number): string {
+  return `balance не ответил за ${Math.round(ms / 1000)} с (1С отвечает долго: холодный старт базы или блокировка). ` +
+    `Повтор безопасен — это только чтение.`;
+}
 
 export async function balanceCall<T = any>(
   token: string,
   method: string,
   path: string,
-  body?: unknown
+  body?: unknown,
+  opts: CallOpts = {}
 ): Promise<Envelope<T>> {
   let r: Response;
+  let text: string;
   try {
     r = await fetch(CFG.balanceApiBase + path, {
       method,
@@ -20,11 +39,15 @@ export async function balanceCall<T = any>(
         ...(body ? { "Content-Type": "application/json" } : {}),
       },
       body: body ? JSON.stringify(body) : undefined,
+      signal: opts.timeoutMs ? AbortSignal.timeout(opts.timeoutMs) : undefined,
     });
+    text = await r.text();
   } catch (e: any) {
+    if (opts.timeoutMs && isTimeout(e)) {
+      return { ok: false, error: { code: "timeout", message: timeoutMessage(opts.timeoutMs) } };
+    }
     return { ok: false, error: { code: "network", message: String(e?.message || e) } };
   }
-  const text = await r.text();
   try {
     return JSON.parse(text) as Envelope<T>;
   } catch {
@@ -39,19 +62,32 @@ export type BinaryResult = {
   buffer: Buffer;
   filename?: string;
   redirectUrl?: string;
+  headers?: Headers;
+  /** Обрыв по тайм-ауту или сети (status = 0): текст для модели. */
+  error?: string;
 };
 
 // Скачивание байтов (PDF/файл). 302 (внешний документ) не следуем — возвращаем URL.
-export async function balanceFetchBinary(token: string, path: string): Promise<BinaryResult> {
-  const r = await fetch(CFG.balanceApiBase + path, {
-    method: "GET",
-    headers: { Authorization: `Bearer ${token}` },
-    redirect: "manual",
-  });
-  if (r.status >= 300 && r.status < 400) {
-    return { ok: true, status: r.status, contentType: "", buffer: Buffer.alloc(0), redirectUrl: r.headers.get("location") || undefined };
+export async function balanceFetchBinary(token: string, path: string, opts: CallOpts = {}): Promise<BinaryResult> {
+  let r: Response;
+  let ab: ArrayBuffer;
+  try {
+    r = await fetch(CFG.balanceApiBase + path, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${token}` },
+      redirect: "manual",
+      signal: opts.timeoutMs ? AbortSignal.timeout(opts.timeoutMs) : undefined,
+    });
+    if (r.status >= 300 && r.status < 400) {
+      return { ok: true, status: r.status, contentType: "", buffer: Buffer.alloc(0), redirectUrl: r.headers.get("location") || undefined };
+    }
+    ab = await r.arrayBuffer();
+  } catch (e: any) {
+    // Без тайм-аута — прежнее поведение (исключение наверх).
+    if (!opts.timeoutMs) throw e;
+    const error = isTimeout(e) ? timeoutMessage(opts.timeoutMs) : `balance недоступен: ${String(e?.message || e)}`;
+    return { ok: false, status: 0, contentType: "", buffer: Buffer.alloc(0), error };
   }
-  const ab = await r.arrayBuffer();
   const cd = r.headers.get("content-disposition") || "";
   const m = /filename\*=UTF-8''([^;]+)/i.exec(cd) || /filename="?([^";]+)"?/i.exec(cd);
   let filename: string | undefined;
@@ -62,5 +98,6 @@ export async function balanceFetchBinary(token: string, path: string): Promise<B
     contentType: r.headers.get("content-type") || "application/octet-stream",
     buffer: Buffer.from(ab),
     filename,
+    headers: r.headers,
   };
 }

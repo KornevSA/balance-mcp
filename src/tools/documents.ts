@@ -28,7 +28,8 @@ export function registerDocumentTools(server: McpServer) {
     title: "Метаданные документа",
     description:
       "Получить метаданные документа по doc_id (+ инфо из 1С, если есть, и список вложений " +
-      "в поле attachments — отчёты и сканы, привязанные к документу).",
+      "в поле attachments — отчёты и сканы, привязанные к документу). " +
+      "Документ прямо из базы 1С и сверка с ним — get_onec_document.",
     inputSchema: { doc_id: z.number().int().positive() },
   }, async (a, extra) => {
     const env = await balanceCall(tokenOf(extra), "GET", `/documents/${a.doc_id}`);
@@ -40,7 +41,8 @@ export function registerDocumentTools(server: McpServer) {
     title: "PDF документа",
     description:
       "Получить PDF документа (счёт/акт и т.п.) по doc_id. Возвращает ВРЕМЕННУЮ ссылку (30 минут), " +
-      "по которой PDF открывается в браузере — её можно отдать человеку или скачать файл самому.",
+      "по которой PDF открывается в браузере — её можно отдать человеку или скачать файл самому. " +
+      "Это PDF, сохранённый в balance (его видит клиент); печатная форма «как сейчас в 1С» — get_onec_document_pdf.",
     inputSchema: { doc_id: z.number().int().positive() },
   }, async (a, extra) => {
     return await deliverFile(tokenOf(extra), `/documents/${a.doc_id}/file`, `Документ ${a.doc_id}.pdf`, extra);
