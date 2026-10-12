@@ -13,6 +13,7 @@ import { registerTaskTools } from "./tools/tasks.js";
 import { registerUserTools } from "./tools/users.js";
 import { registerOneCTools } from "./tools/onec.js";
 import { registerOneCWriteTools } from "./tools/onecWrite.js";
+import { registerEdoTools } from "./tools/edo.js";
 
 export function createMcpServer(): McpServer {
   const server = new McpServer({ name: "balance-mcp", version: "0.1.0" });
@@ -30,5 +31,6 @@ export function createMcpServer(): McpServer {
   registerUserTools(server);
   registerOneCTools(server);
   registerOneCWriteTools(server);
+  registerEdoTools(server);
   return server;
 }

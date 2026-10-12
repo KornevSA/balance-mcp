@@ -8,6 +8,10 @@
 // не пишется) и возвращает превью + токен; запись — только повторным вызовом с ТЕМИ ЖЕ полями и confirm.
 // Токен — HMAC от операции и полей (util.ts), 15 минут. Где делать нечего (уже есть, ничего не изменится)
 // или нельзя (дубли, документ бухгалтера, режим выключен) — токена нет.
+//
+// Документы поставщиков (задача пользователя 13.10.2026, balance class/onec_api_supplier.php, право onec.write):
+// поступление или счёт от поставщика из входящего документа Диадока или из данных пользователя, поставщик по ИНН
+// с договором, номенклатура и правка такого документа (PUT). Чтение Диадока — edo.ts.
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -60,6 +64,80 @@ function who(balance: any): string {
 
 function lines(items: string[]): string {
   return items.filter(Boolean).map((s) => `• ${s}`).join("\n");
+}
+
+/** Без null/undefined: в balance уходят только переданные поля. */
+function dropNulls<T extends Record<string, any>>(o: T): Partial<T> {
+  return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== null && v !== undefined)) as Partial<T>;
+}
+
+const lc = (s?: string | null): string | null => (s ? s.toLowerCase() : null);
+const INN_RE = /^\d{10}(\d{2})?$/;
+
+/** Строка документа поставщика (create_onec_supplier_document). */
+const supplierLine = () => z.object({
+  line: z.number().int().positive().optional().describe("Номер строки (по умолчанию — по порядку с 1); на него ссылается line_nomenclature"),
+  content: z.string().min(1).max(1000).describe("Текст строки — наименование товара или услуги"),
+  quantity: z.number().positive().optional().describe("Количество (по умолчанию 1)"),
+  amount: z.number().nonnegative().optional().describe("Сумма строки С НДС — или price"),
+  price: z.number().nonnegative().optional().describe("Цена за единицу С НДС — или amount"),
+  vat_rate: z.string().min(1).max(20).describe("Ставка НДС: 22, 20, 10, 7, 5, 0, none (без НДС) или код 1С (НДС22, БезНДС…)"),
+  vat_amount: z.number().nonnegative().optional().describe("Сумма НДС строки, если известна"),
+  nomenclature_id: onecUuid("номенклатуры этой строки").optional(),
+});
+
+/** Счета учёта строки (update_onec_document): коды плана счетов, аналитика — id или наименование. */
+const acc = () => z.string().min(1).max(150);
+const itemAccounts = () => z.object({
+  expense: acc().optional().describe("Счёт затрат: 26, 44.01…"),
+  expense_analytics: z.union([acc(), z.array(acc()).min(1).max(3)]).optional().describe("Аналитика счёта затрат — id или наименование (до трёх: статья затрат…)"),
+  expense_department_id: acc().optional().describe("Подразделение затрат — id или наименование"),
+  vat: acc().optional().describe("Счёт учёта НДС: 19.04…"),
+  inventory: acc().optional().describe("Счёт учёта товара: 41.01, 10.01…"),
+});
+const settlementAccounts = () => z.object({
+  settlement: acc().optional().describe("Счёт расчётов с поставщиком: 60.01…"),
+  advances: acc().optional().describe("Счёт авансов: 60.02…"),
+});
+
+/** Строка документа поставщика при правке: заменяет строки целиком. */
+const editItem = () => z.object({
+  nomenclature_id: onecUuid("номенклатуры").optional(),
+  content: z.string().min(1).max(1000).optional().describe("Текст строки"),
+  quantity: z.number().positive().optional().describe("Количество (по умолчанию 1)"),
+  price: z.number().nonnegative().describe("Цена за единицу С НДС"),
+  vat_rate: z.string().min(1).max(20).describe("Ставка НДС: 22, 20, 10, 7, 5, 0, none (без НДС) или код 1С (НДС22, БезНДС…)"),
+  vat_amount: z.number().nonnegative().optional().describe("Сумма НДС строки"),
+  accounts: itemAccounts().optional().describe("Счета учёта строки"),
+});
+
+function accText(o: Record<string, any> | undefined): string {
+  return Object.entries(o || {}).map(([k, v]) => `${k} ${Array.isArray(v) ? v.join(" / ") : v}`).join(", ");
+}
+
+/** Превью документа поставщика человеческим текстом. */
+function supplierDocText(d: any): string {
+  const src = d.source || {};
+  const cp = d.counterparty || {};
+  const t = d.totals || {};
+  const items: any[] = d.payload?.items || [];
+  const by: Record<string, string> = { given: "передан onec_counterparty_id", inn_kpp: "найден по ИНН и КПП", inn: "найден по ИНН" };
+  const has = (v: any) => v !== null && v !== undefined;
+  return `${d.kind_name || d.kind || "Документ поставщика"} в 1С org ${d.org_id}${d.organization ? ` «${d.organization}»` : ""}:\n` + lines([
+    src.type === "diadoc"
+      ? `Источник: Диадок — «${src.title || "—"}» (${src.diadoc_type || "—"})${src.status_text ? `, ${src.status_text}` : ""}${src.grounds ? `; основание: ${src.grounds}` : ""}`
+      : `Источник: данные пользователя (продавец ИНН ${src.seller?.inn || "—"}${src.seller?.name ? ` «${src.seller.name}»` : ""})`,
+    has(d.incoming_number) ? `Входящий № ${d.incoming_number || "—"} от ${d.incoming_date || "—"}; дата документа в 1С ${d.date || "—"}` : "",
+    cp.id
+      ? `Поставщик в 1С: «${cp.name}» ИНН ${cp.inn || "—"}${cp.kpp ? ` КПП ${cp.kpp}` : ""} (id ${cp.id}, ${by[cp.by] || cp.by})`
+      : `Поставщик: ${cp.note || "в 1С не найден"}${(cp.candidates || []).length ? `\n${JSON.stringify(cp.candidates)}` : ""}`,
+    d.contract ? `Договор: «${d.contract.name ?? ""}» (id ${d.contract.id})` : "",
+    items.length ? `Строк: ${items.length}; сумма ${money(t.sum)}, НДС ${money(t.vat)}${has(t.source_total) ? `; итог документа ${money(t.source_total)}` : ""}` : "",
+    has(d.post) ? `Проводить: ${d.post ? "да" : "нет"}${has(d.upd) ? `; УПД (со счётом-фактурой): ${d.upd ? "да" : "нет"}` : ""}` : "",
+    d.external_id ? `Ключ (external_id): ${d.external_id}` : "",
+    ...((d.checks || []) as string[]),
+    ...((d.warnings || []) as string[]).map((w) => `⚠ ${w}`),
+  ]);
 }
 
 /** PDF из ответа balance (base64) → временные ссылки; base64 в ответ модели не попадает. */
@@ -417,7 +495,8 @@ export function registerOneCWriteTools(server: McpServer) {
     description:
       "Провести (post), отменить проведение (unpost), пометить на удаление (delete — физически не удаляется, проведённый " +
       "распроводится) или снять пометку (restore) у документа 1С, КОТОРЫЙ СОЗДАЛ balance: счёт или акт, отправленный из " +
-      "balance, оплата картой и её реализация из выгрузки, акт сверки из MCP. Документы бухгалтера (выписки, касса, ручные) " +
+      "balance, оплата картой и её реализация из выгрузки, акт сверки из MCP, поступление или счёт от поставщика, созданные " +
+      "через MCP (create_onec_supplier_document). Документы бухгалтера (выписки, касса, ручные) " +
       "не трогаются — balance откажет. Закрытый период 1С не обходится. Только по явной просьбе. ДВУХШАГОВО: без confirm — " +
       "документ, откуда он и что изменится; с confirm — действие. Документ — doc_id (balance) или org_id + onec_id.",
     inputSchema: {
@@ -458,5 +537,321 @@ export function registerOneCWriteTools(server: McpServer) {
     if (!env.ok) return onecFail(env);
     const d = env.data || {};
     return ok(`Готово (${a.action}): ${docLine(d.document)} в 1С org ${d.org_id}.`, d);
+  });
+
+  // ======================================================================= документы поставщиков
+  server.registerTool("create_onec_supplier_document", {
+    title: "Документ поставщика в 1С: поступление или счёт (с подтверждением)",
+    description:
+      "Завести в 1С документ поставщика: поступление (kind=purchase — акт, накладная, УПД) или счёт от поставщика " +
+      "(supplier_invoice). Источники: source=diadoc — входящий документ Диадока (message_id и entity_id из " +
+      "list_diadoc_documents; продавец, номер, дата и строки УПД берутся из XML; вид по умолчанию: счёт Диадока — счёт от " +
+      "поставщика, остальное — поступление; у счёта-файла и прочих видов строк нет — передайте lines, они же заменяют строки " +
+      "УПД); source=manual — данные, которые дал пользователь (seller, number, date, lines, kind обязателен; ключ дублей — как " +
+      "у «Первички», так что тот же документ, заведённый по фото, не задвоится). Поставщик ищется в 1С по ИНН продавца (КПП " +
+      "уточняет); нет — сначала create_onec_supplier, несколько — передайте onec_counterparty_id. У поступления КАЖДОЙ строке " +
+      "нужна номенклатура 1С (nomenclature_id — общая, line_nomenclature или lines[].nomenclature_id — по строкам; найти — " +
+      "search_onec_nomenclature, завести — create_onec_nomenclature); у счёта от поставщика — не обязательна, строка пишется " +
+      "текстом. Дубли: тот же документ (тот же ключ) вернёт уже созданный; документ с тем же входящим номером у того же " +
+      "контрагента (обычно его завёл бухгалтер) — отказ, allow_duplicate=true — только если это точно другой документ. " +
+      "Договор не указан — 1С подставит основной. Проводить (post) — только если об этом явно попросили (по умолчанию нет). " +
+      "ДВУХШАГОВО: без confirm — превью (поставщик, договор, строки, суммы, проверки) и токен, ничего не создаётся; с confirm " +
+      "и ТЕМИ ЖЕ полями — запись. Поправить потом — update_onec_document.",
+    inputSchema: {
+      org_id: orgId(),
+      source: z.enum(["diadoc", "manual"]).optional()
+        .describe("diadoc — входящий документ Диадока, manual — данные пользователя (по умолчанию diadoc, если передан message_id)"),
+      message_id: z.string().regex(UUID_RE, "GUID документа Диадока").optional().describe("source=diadoc: message_id документа Диадока (list_diadoc_documents)"),
+      entity_id: z.string().regex(UUID_RE, "GUID документа Диадока").optional().describe("source=diadoc: entity_id документа Диадока"),
+      kind: z.enum(["purchase", "supplier_invoice"]).optional()
+        .describe("purchase — поступление (акт, накладная, УПД), supplier_invoice — счёт от поставщика; для manual обязателен"),
+      seller: z.object({
+        inn: z.string().regex(INN_RE, "10 или 12 цифр").optional().describe("ИНН продавца"),
+        kpp: z.string().regex(/^\d{9}$/, "9 цифр").optional().describe("КПП продавца"),
+        name: z.string().max(255).optional().describe("Наименование продавца"),
+      }).optional().describe("source=manual: продавец (нужен inn или onec_counterparty_id)"),
+      number: z.string().min(1).max(30).optional().describe("source=manual: номер документа поставщика (входящий номер)"),
+      date: date("source=manual: дата документа поставщика").optional(),
+      lines: z.array(supplierLine()).min(1).max(200).optional()
+        .describe("Строки: для manual обязательны; для diadoc — замена строк документа (у счёта-файла и прочих видов — нужны)"),
+      onec_counterparty_id: onecUuid("поставщика").optional().describe("id поставщика в 1С, если по ИНН он не находится однозначно"),
+      onec_contract_id: onecUuid("договора").optional().describe("Договор с поставщиком (list_onec_contracts); по умолчанию — основной"),
+      nomenclature_id: onecUuid("номенклатуры").optional().describe("Номенклатура 1С для всех строк (search_onec_nomenclature)"),
+      line_nomenclature: z.array(z.object({
+        line: z.number().int().positive().describe("Номер строки"),
+        nomenclature_id: onecUuid("номенклатуры"),
+      })).max(200).optional().describe("Номенклатура по строкам: [{line, nomenclature_id}] — важнее общей"),
+      document_date: date("Дата документа в 1С (по умолчанию — дата документа поставщика)").optional(),
+      upd: z.boolean().optional().describe("Поступление: УПД со счётом-фактурой (по умолчанию — по функции УПД Диадока; для manual — нет)"),
+      post: z.boolean().optional().describe("Провести в 1С — только если об этом явно попросили (по умолчанию false)"),
+      comment: z.string().max(1000).optional().describe("Комментарий в 1С (по умолчанию — откуда документ)"),
+      allow_duplicate: z.boolean().optional().describe("Создать, хотя в 1С есть документ с тем же входящим номером у того же контрагента (по умолчанию false)"),
+      confirm: confirm(),
+    },
+    annotations: WRITE,
+  }, async (a, extra) => {
+    const source = a.source ?? (a.message_id || a.entity_id ? "diadoc" : "manual");
+    if (source === "diadoc") {
+      if (!a.message_id || !a.entity_id) return fail("Для source=diadoc нужны message_id и entity_id документа (list_diadoc_documents).");
+      if (a.seller || a.number || a.date) {
+        return fail("Для source=diadoc продавец, номер и дата берутся из документа Диадока — не передавайте seller, number, date (дата документа в 1С — document_date).");
+      }
+    } else {
+      if (a.message_id || a.entity_id) return fail("message_id и entity_id — только для source=diadoc.");
+      if (!a.kind) return fail("Для ручного ввода нужен kind: purchase (поступление) или supplier_invoice (счёт от поставщика).");
+      if (!a.number || !a.date) return fail("Для ручного ввода нужны number и date документа поставщика.");
+      if (!a.lines?.length) return fail("Для ручного ввода нужны строки lines.");
+      if (!a.seller?.inn && !a.onec_counterparty_id) return fail("Нужен seller.inn (ИНН продавца) или onec_counterparty_id.");
+    }
+    for (const [i, l] of (a.lines || []).entries()) {
+      if ((l.amount === undefined) === (l.price === undefined)) {
+        return fail(`lines[${i}]: передайте что-то одно — amount (сумма строки с НДС) или price (цена с НДС).`);
+      }
+    }
+    const fields = {
+      org_id: a.org_id, source,
+      message_id: lc(a.message_id), entity_id: lc(a.entity_id),
+      kind: a.kind ?? null,
+      seller: source === "manual" ? { inn: a.seller?.inn ?? null, kpp: a.seller?.kpp ?? null, name: a.seller?.name?.trim() || null } : null,
+      number: a.number?.trim() || null, date: a.date ?? null,
+      lines: a.lines ? a.lines.map((l, i) => ({
+        line: l.line ?? i + 1, content: l.content.trim(), quantity: l.quantity ?? 1, amount: l.amount ?? null, price: l.price ?? null,
+        vat_rate: l.vat_rate.trim(), vat_amount: l.vat_amount ?? null, nomenclature_id: lc(l.nomenclature_id),
+      })) : null,
+      onec_counterparty_id: lc(a.onec_counterparty_id), onec_contract_id: lc(a.onec_contract_id), nomenclature_id: lc(a.nomenclature_id),
+      line_nomenclature: a.line_nomenclature ? a.line_nomenclature.map((x) => ({ line: x.line, nomenclature_id: x.nomenclature_id.toLowerCase() })) : null,
+      document_date: a.document_date ?? null, upd: a.upd ?? null, post: a.post ?? false,
+      comment: a.comment?.trim() || null, allow_duplicate: a.allow_duplicate ?? false,
+    };
+    const { org_id: _org, ...rest } = fields;
+    const body = dropNulls({ ...rest, seller: fields.seller ? dropNulls(fields.seller) : null, lines: fields.lines ? fields.lines.map((l) => dropNulls(l)) : null });
+    const path = `/onec/${a.org_id}/supplier-documents`;
+
+    if (!a.confirm) {
+      const env = await call(extra, "POST", path, { ...body, dry_run: true });
+      if (!env.ok) return onecFail(env);
+      const d = env.data || {};
+      const text = supplierDocText(d);
+      if (d.result === "blocked" || d.blocked) return fail(`${text}\nСоздать нельзя: ${d.blocked ?? d.note ?? "см. проверки"}`);
+      if (d.will === "nothing") {
+        if (d.result === "exists") return nothingToDo(`${text}\nУже создан в 1С: ${docLine(d.document)} (id ${d.document?.id ?? d.onec_id}). ${d.note ?? ""}`, d);
+        const dups = ((d.duplicates || []) as any[]).map((x) => `${docLine(x)}, входящий № ${x.incoming_number || "—"} от ${x.incoming_date || "—"} (id ${x.id})`);
+        return nothingToDo(`${text}\n${d.note ?? "В 1С уже есть такой документ"}${dups.length ? "\n" + lines(dups) : ""}`, d);
+      }
+      return preview("onec_supplier_doc", 0, fields, text, d);
+    }
+    const v = verifyConfirmToken(a.confirm, "onec_supplier_doc", 0, fields);
+    if (!v.ok) return badToken("create_onec_supplier_document", v.reason);
+    const env = await call(extra, "POST", path, body);
+    if (!env.ok) return onecFail(env);
+    const d = env.data || {};
+    const doc = d.document || {};
+    return ok(`${d.kind_name || "Документ поставщика"} ${d.result === "created" ? "создан" : "уже был"} в 1С org ${d.org_id}: ${docLine(doc)} (id ${doc.id ?? d.onec_id}).` +
+      ((d.warnings || []).length ? `\n⚠ ${(d.warnings as string[]).join("\n⚠ ")}` : "") +
+      "\nПроверить — get_onec_document; поправить строки, счета учёта, договор — update_onec_document; провести — set_onec_document_state.", d);
+  });
+
+  server.registerTool("create_onec_supplier", {
+    title: "Поставщик в 1С по ИНН (с подтверждением)",
+    description:
+      "Найти поставщика в базе 1С по ИНН или завести его по ЕГРЮЛ/ЕГРИП (наименование и реквизиты 1С берёт из реестра) и по " +
+      "желанию — договор «С поставщиком» (contract: номер и дата; если такой у поставщика уже есть — новый не создаётся). " +
+      "Нужен перед create_onec_supplier_document, когда поставщика в 1С нет. Клиента в balance не заводит. Если " +
+      "контрагентов с этим ИНН в 1С несколько — ничего не делается: укажите kpp или пусть бухгалтер разберёт дубли. name — " +
+      "только на случай, если реестр недоступен (тогда поставщик заводится по нему). ДВУХШАГОВО: без confirm — превью и " +
+      "токен; с confirm и ТЕМИ ЖЕ полями — запись.",
+    inputSchema: {
+      org_id: orgId(),
+      inn: z.string().regex(INN_RE, "10 или 12 цифр").describe("ИНН поставщика"),
+      kpp: z.string().regex(/^\d{9}$/, "9 цифр").optional().describe("КПП — если у ИНН несколько подразделений"),
+      name: z.string().min(1).max(100).optional().describe("Наименование — только на случай недоступного ЕГРЮЛ/ЕГРИП"),
+      contract: z.object({
+        number: z.string().min(1).max(50).describe("Номер договора"),
+        date: date("Дата договора"),
+        name: z.string().max(100).optional().describe("Наименование договора (по умолчанию 1С сложит из номера и даты)"),
+      }).optional().describe("Договор «С поставщиком», если нужен"),
+      confirm: confirm(),
+    },
+    annotations: WRITE,
+  }, async (a, extra) => {
+    const fields = {
+      org_id: a.org_id, inn: a.inn, kpp: a.kpp ?? null, name: a.name?.trim() || null,
+      contract: a.contract ? { number: a.contract.number.trim(), date: a.contract.date, name: a.contract.name?.trim() || null } : null,
+    };
+    const body = dropNulls({ inn: fields.inn, kpp: fields.kpp, name: fields.name, contract: fields.contract ? dropNulls(fields.contract) : null });
+    const path = `/onec/${a.org_id}/suppliers`;
+    if (!a.confirm) {
+      const env = await call(extra, "POST", path, { ...body, dry_run: true });
+      if (!env.ok) return onecFail(env);
+      const d = env.data || {};
+      if (d.result === "ambiguous") return fail(`${d.note}\n${JSON.stringify(d.candidates || [])}`);
+      const cp = d.counterparty || {};
+      const ct = d.contract;
+      const text = `Поставщик ИНН ${d.inn ?? a.inn}${d.kpp ? ` КПП ${d.kpp}` : ""} в 1С org ${d.org_id ?? a.org_id}:\n` + lines([
+        cp.result === "exists"
+          ? `Уже есть: «${cp.name}» (id ${cp.id}${cp.kpp ? `, КПП ${cp.kpp}` : ""})`
+          : `Не найден — будет заведён по ЕГРЮЛ/ЕГРИП${cp.payload?.external_id ? ` (ключ ${cp.payload.external_id})` : ""}` +
+            (fields.name ? `; если реестр недоступен — по наименованию «${fields.name}»` : ""),
+        ct ? (ct.result === "exists" ? `Договор уже есть: «${ct.name}» (id ${ct.id})` : (ct.note || `Будет заведён договор «С поставщиком» № ${fields.contract?.number} от ${fields.contract?.date}`)) : "",
+        ...((d.warnings || []) as string[]).map((w) => `⚠ ${w}`),
+      ]);
+      if (d.will === "nothing") return nothingToDo(text, d);
+      return preview("onec_supplier", 0, fields, text, d);
+    }
+    const v = verifyConfirmToken(a.confirm, "onec_supplier", 0, fields);
+    if (!v.ok) return badToken("create_onec_supplier", v.reason);
+    const env = await call(extra, "POST", path, body);
+    if (!env.ok) return onecFail(env);
+    const d = env.data || {};
+    const cp = d.counterparty || {};
+    const ct = d.contract;
+    const verb = (r: string) => (r === "created" ? "заведён" : "уже был");
+    return ok(`Поставщик «${cp.name}» (id ${cp.id}) ${verb(cp.result)} в 1С org ${d.org_id ?? a.org_id}` +
+      (ct ? `; договор «${ct.name}» (id ${ct.id}) ${verb(ct.result)}` : "") + "." +
+      ((d.warnings || []).length ? `\n⚠ ${(d.warnings as string[]).join("\n⚠ ")}` : ""), d);
+  });
+
+  server.registerTool("create_onec_nomenclature", {
+    title: "Номенклатура в 1С (с подтверждением)",
+    description:
+      "Завести позицию номенклатуры (услугу или товар) в базе 1С — она нужна строкам поступления (create_onec_supplier_document). " +
+      "Сначала поищите подходящую (search_onec_nomenclature). Если позиция с точно таким наименованием уже есть — новая не " +
+      "заводится, превью вернёт её id. Вид номенклатуры (kind) — из get_onec_meta (nomenclature_kinds): если подходящих видов " +
+      "несколько, без kind 1С откажет — превью их перечислит, повторите с kind. ДВУХШАГОВО: без confirm — превью и токен; с " +
+      "confirm и ТЕМИ ЖЕ полями — запись.",
+    inputSchema: {
+      org_id: orgId(),
+      name: z.string().min(1).max(100).describe("Наименование (до 100 символов)"),
+      full_name: z.string().max(1000).optional().describe("Полное наименование (для документов)"),
+      is_service: z.boolean().optional().describe("Услуга (по умолчанию true) или товар (false)"),
+      kind: z.string().max(100).optional().describe("Вид номенклатуры 1С (get_onec_meta → nomenclature_kinds)"),
+      unit: z.string().max(50).optional().describe("Единица измерения"),
+      vat_rate: z.string().max(20).optional().describe("Ставка НДС по умолчанию — код 1С (НДС22, БезНДС…)"),
+      article: z.string().max(50).optional().describe("Артикул"),
+      group_id: onecUuid("группы номенклатуры").optional().describe("Группа (search_onec_nomenclature groups=true)"),
+      comment: z.string().max(1000).optional(),
+      confirm: confirm(),
+    },
+    annotations: WRITE,
+  }, async (a, extra) => {
+    const t = (s?: string) => s?.trim() || null;
+    const fields = {
+      org_id: a.org_id, name: a.name.trim(), full_name: t(a.full_name), is_service: a.is_service ?? true, kind: t(a.kind),
+      unit: t(a.unit), vat_rate: t(a.vat_rate), article: t(a.article), group_id: lc(a.group_id), comment: t(a.comment),
+    };
+    if (!fields.name) return fail("name — от 1 до 100 символов.");
+    const { org_id: _org, ...rest } = fields;
+    const body = dropNulls(rest);
+    const path = `/onec/${a.org_id}/nomenclature`;
+    if (!a.confirm) {
+      const env = await call(extra, "POST", path, { ...body, dry_run: true });
+      if (!env.ok) return onecFail(env);
+      const d = env.data || {};
+      if (d.result === "exists" || d.will === "nothing") {
+        const found = ((d.nomenclature || []) as any[]).map((n) => `«${n.name}» (id ${n.id}${n.is_service === false ? ", товар" : ""})`).join("; ");
+        return nothingToDo(`Номенклатура «${fields.name}» уже есть в 1С org ${a.org_id}: ${found || "—"}. Используйте её id.`, d);
+      }
+      const kinds: string[] = (d.kinds || []).filter(Boolean);
+      const p = d.payload || {};
+      const text = `Номенклатура «${fields.name}» в 1С org ${a.org_id} не найдена — будет заведена:\n` + lines([
+        `${p.is_service === false ? "Товар" : "Услуга"}${p.kind ? `, вид «${p.kind}»` : ""}${p.unit ? `, ед. ${p.unit}` : ""}${p.vat_rate ? `, НДС ${p.vat_rate}` : ""}${p.article ? `, артикул ${p.article}` : ""}`,
+        p.full_name ? `Полное наименование: «${p.full_name}»` : "",
+        p.external_id ? `Ключ (external_id): ${p.external_id}` : "",
+        kinds.length === 1 && !fields.kind ? `Вид номенклатуры: «${kinds[0]}» (единственный подходящий)` : "",
+      ]);
+      if (!fields.kind && kinds.length > 1) {
+        return fail(`${text}\nПодходящих видов номенклатуры несколько — без kind 1С откажет. Повторите с kind — одним из: ${kinds.map((k) => `«${k}»`).join(", ")}.`);
+      }
+      return preview("onec_nom", 0, fields, text, d);
+    }
+    const v = verifyConfirmToken(a.confirm, "onec_nom", 0, fields);
+    if (!v.ok) return badToken("create_onec_nomenclature", v.reason);
+    const env = await call(extra, "POST", path, body);
+    if (!env.ok) return onecFail(env);
+    const d = env.data || {};
+    const n = d.nomenclature || {};
+    return ok(`Номенклатура «${n.name ?? fields.name}» ${d.result === "created" ? "заведена" : "уже была"} в 1С org ${a.org_id}: id ${n.id}.`, d);
+  });
+
+  server.registerTool("update_onec_document", {
+    title: "Поправить документ поставщика в 1С (с подтверждением)",
+    description:
+      "Поправить в 1С поступление или счёт от поставщика, СОЗДАННЫЙ ЧЕРЕЗ MCP (create_onec_supplier_document): комментарий, " +
+      "входящий номер и дату, дату документа, договор, строки (items — ЗАМЕНЯЮТ строки целиком: цена с НДС, ставка — код 1С " +
+      "НДС22/БезНДС…, номенклатура, счета учёта строки), счета учёта отдельных строк по номеру (item_accounts — без замены " +
+      "строк), счета расчётов (accounts: settlement, advances), проведение (post — только если об этом явно попросили). " +
+      "Остальные документы (бухгалтера, реализации, счета клиентам) не правятся — balance откажет. Проведённый документ после " +
+      "правки перепроводится. Нужно хотя бы одно поле. ДВУХШАГОВО: без confirm — документ сейчас (строки, счета) и что " +
+      "изменится, токен; с confirm и ТЕМИ ЖЕ полями — запись.",
+    inputSchema: {
+      org_id: orgId(),
+      onec_id: onecUuid("документа"),
+      comment: z.string().max(1000).optional().describe("Комментарий (пустая строка — очистить)"),
+      incoming_number: z.string().max(30).optional().describe("Входящий номер"),
+      incoming_date: date("Входящая дата").optional(),
+      date: date("Дата документа в 1С").optional(),
+      contract_id: onecUuid("договора").optional().describe("Договор с поставщиком (list_onec_contracts)"),
+      post: z.boolean().optional().describe("Провести (true) — только если об этом явно попросили"),
+      items: z.array(editItem()).min(1).max(200).optional().describe("Строки — ЗАМЕНЯЮТ строки документа целиком"),
+      item_accounts: z.array(z.object({
+        line: z.number().int().positive().describe("Номер строки документа"),
+        accounts: itemAccounts(),
+      })).min(1).max(200).optional().describe("Счета учёта отдельных строк: [{line, accounts}]"),
+      accounts: settlementAccounts().optional().describe("Счета расчётов с поставщиком"),
+      confirm: confirm(),
+    },
+    annotations: DESTRUCTIVE,
+  }, async (a, extra) => {
+    const ch: Record<string, any> = {};
+    if (a.comment !== undefined) ch.comment = a.comment.trim();
+    if (a.incoming_number !== undefined) ch.incoming_number = a.incoming_number.trim();
+    if (a.incoming_date !== undefined) ch.incoming_date = a.incoming_date;
+    if (a.date !== undefined) ch.date = a.date;
+    if (a.contract_id !== undefined) ch.contract_id = a.contract_id.toLowerCase();
+    if (a.post !== undefined) ch.post = a.post;
+    if (a.items !== undefined) {
+      ch.items = a.items.map((it) => dropNulls({
+        nomenclature_id: lc(it.nomenclature_id), content: it.content?.trim() || null, quantity: it.quantity ?? 1, price: it.price,
+        vat_rate: it.vat_rate.trim(), vat_amount: it.vat_amount ?? null, accounts: it.accounts ?? null,
+      }));
+    }
+    if (a.item_accounts !== undefined) ch.item_accounts = a.item_accounts.map((x) => ({ line: x.line, accounts: x.accounts }));
+    if (a.accounts !== undefined) ch.accounts = a.accounts;
+    const emptyAcc = [...(ch.items || []).map((it: any) => it.accounts), ...(ch.item_accounts || []).map((x: any) => x.accounts), ch.accounts]
+      .some((o) => o !== undefined && o !== null && !Object.keys(o).length);
+    if (emptyAcc) return fail("Счета (accounts) переданы пустым объектом — укажите хотя бы один счёт или уберите поле.");
+    if (!Object.keys(ch).length) {
+      return fail("Нечего менять: передайте хотя бы одно поле — comment, incoming_number, incoming_date, date, contract_id, post, items, item_accounts или accounts.");
+    }
+    const uid = a.onec_id.toLowerCase();
+    const fields = { org_id: a.org_id, onec_id: uid, changes: ch };
+    const path = `/onec/${a.org_id}/documents/${uid}`;
+
+    if (!a.confirm) {
+      const env = await call(extra, "PUT", path, { ...ch, dry_run: true });
+      if (!env.ok) return onecFail(env);
+      const d = env.data || {};
+      const before: any[] = d.items_before || [];
+      const sum = (ch.items || []).reduce((s: number, it: any) => s + Number(it.price) * Number(it.quantity ?? 1), 0);
+      const text = `Правка в 1С org ${d.org_id ?? a.org_id}: ${docLine(d.document)} (id ${uid}).\n` + lines([
+        "comment" in ch ? `Комментарий: «${ch.comment}»` : "",
+        "incoming_number" in ch ? `Входящий номер: ${ch.incoming_number || "(пусто)"}` : "",
+        "incoming_date" in ch ? `Входящая дата: ${ch.incoming_date}` : "",
+        "date" in ch ? `Дата документа: ${ch.date}` : "",
+        "contract_id" in ch ? `Договор: id ${ch.contract_id}` : "",
+        "post" in ch ? `Провести: ${ch.post ? "да" : "нет"}` : "",
+        ch.items ? `Строки заменяются целиком: было ${before.length}, станет ${ch.items.length} на ${money(sum)}` : "",
+        ch.item_accounts ? `Счета учёта строк: ${(ch.item_accounts as any[]).map((x) => `№ ${x.line} — ${accText(x.accounts)}`).join("; ")}` : "",
+        ch.accounts ? `Счета расчётов: ${accText(ch.accounts)}` : "",
+        d.note,
+      ]);
+      return preview("onec_doc_edit", 0, fields, text, d);
+    }
+    const v = verifyConfirmToken(a.confirm, "onec_doc_edit", 0, fields);
+    if (!v.ok) return badToken("update_onec_document", v.reason);
+    const env = await call(extra, "PUT", path, ch);
+    if (!env.ok) return onecFail(env);
+    const d = env.data || {};
+    return ok(`Изменён в 1С org ${d.org_id ?? a.org_id}: ${docLine(d.summary || d.document)} (было: ${docLine(d.before)}).`, d);
   });
 }

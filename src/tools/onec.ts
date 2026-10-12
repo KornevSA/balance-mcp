@@ -19,7 +19,7 @@ const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: 
 export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const KINDS = [
-  "sale", "sale_return", "sale_correction", "invoice", "vat_invoice", "purchase",
+  "sale", "sale_return", "sale_correction", "invoice", "vat_invoice", "purchase", "supplier_invoice",
   "bank_in", "bank_out", "cash_in", "cash_out", "card_payment", "reconciliation",
 ] as const;
 
@@ -44,6 +44,8 @@ export function onecFail(env: any) {
     t += `\nПодходящие контрагенты в 1С (выберите id и вызовите по onec_id):\n${JSON.stringify(e.candidates)}`;
   }
   if (Array.isArray(e.warnings) && e.warnings.length) t += `\n${e.warnings.join("\n")}`;
+  if (Array.isArray(e.checks) && e.checks.length) t += `\n${e.checks.join("\n")}`;
+  if (Array.isArray(e.duplicates) && e.duplicates.length) t += `\nУже в 1С:\n${JSON.stringify(e.duplicates)}`;
   return fail(t);
 }
 
@@ -114,8 +116,10 @@ export function registerOneCTools(server: McpServer) {
       "Базы 1С по организациям: для каждой org_id — подключено ли API 1С (ready / v1_state=ok), когда проверялось, " +
       "имя публикации и версия API. Вызывайте первым, чтобы выбрать org_id для остальных тулзов 1С. " +
       "Одна организация — одна база 1С (ИП Корнев, Интер, НотиСенд). Тулзы get/list/search/lookup_onec_* только читают 1С; " +
-      "запись — отдельные тулзы с подтверждением (create_onec_*, fill_onec_*, send_document_to_onec, pull_onec_bank_payments, " +
-      "set_onec_document_state).",
+      "запись — отдельные тулзы с подтверждением (create_onec_* — в том числе документы поставщиков, поставщики и " +
+      "номенклатура, fill_onec_*, update_onec_document, send_document_to_onec, pull_onec_bank_payments, " +
+      "set_onec_document_state). Входящие документы поставщиков из Диадока — get_edo_status, list_diadoc_documents, " +
+      "get_diadoc_document.",
     inputSchema: {},
     annotations: READ_ONLY,
   }, async (_a, extra) => {
@@ -239,9 +243,9 @@ export function registerOneCTools(server: McpServer) {
   server.registerTool("list_onec_documents", {
     title: "Документы в 1С",
     description:
-      "Документы в базе 1С: реализации, счета, поступления на счёт (bank_in), списания, касса, оплаты картой, " +
-      "акты сверки и др. (kind). По контрагенту (onec_counterparty_id или customer_id) — новые сначала, без from — " +
-      "за последний год. По всем контрагентам — по возрастанию даты, from обязателен, окно до 92 дней (только " +
+      "Документы в базе 1С: реализации, счета, поступления от поставщиков (purchase), счета от поставщика " +
+      "(supplier_invoice), поступления на счёт (bank_in), списания, касса, оплаты картой, акты сверки и др. (kind). " +
+      "По контрагенту (onec_counterparty_id или customer_id) — новые сначала, без from — за последний год. По всем контрагентам — по возрастанию даты, from обязателен, окно до 92 дней (только " +
       "пользователю без зоны дилера). Непроведённые показываются всегда, помеченные — с include_deleted. У " +
       "поступлений на счёт есть плательщик по выписке (payer), покупатель по номеру счёта (buyer, invoices) и " +
       "attention — признаки оплаты за третье лицо или через посредника. Связанные документы balance — balance_doc_id.",
@@ -290,7 +294,7 @@ export function registerOneCTools(server: McpServer) {
       onec_id: onecUuid("документа").optional(),
       doc_id: z.number().int().positive().optional().describe("id документа в balance"),
       kind: z.enum(KINDS).optional().describe("Вид документа — вместе с external_id"),
-      external_id: z.string().max(100).optional().describe("Ключ документа, созданного через API 1С (balance:act:N, routerai:tx:N…)"),
+      external_id: z.string().max(100).optional().describe("Ключ документа, созданного через API 1С (balance:act:N, routerai:tx:N, diadoc:<message_id>:<entity_id> — документ поставщика из Диадока…)"),
     },
     annotations: READ_ONLY,
   }, async (a, extra) => {

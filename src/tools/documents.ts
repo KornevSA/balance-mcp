@@ -28,7 +28,9 @@ export function registerDocumentTools(server: McpServer) {
     title: "Метаданные документа",
     description:
       "Получить метаданные документа по doc_id (+ инфо из 1С, если есть, и список вложений " +
-      "в поле attachments — отчёты и сканы, привязанные к документу). " +
+      "в поле attachments — отчёты и сканы, привязанные к документу). Поле edo — ушёл ли документ через ЭДО " +
+      "(Диадок): {provider, state (signed | waiting | sent | rejected | revoked | error), state_name, status_text, " +
+      "edo_type, edo_number, edo_date, sent_at}; null — отправка в Диадоке не найдена (или синхронизация выключена). " +
       "Документ прямо из базы 1С и сверка с ним — get_onec_document.",
     inputSchema: { doc_id: z.number().int().positive() },
   }, async (a, extra) => {
