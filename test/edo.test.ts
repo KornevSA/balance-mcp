@@ -385,3 +385,51 @@ test("правка документа: нужно хотя бы одно пол�
   assert.match(textOf(r), /onec_not_balance_document/);
   assert.equal(calls[0].body.post, true);
 });
+
+// ---------------------------------------------------------------------------------------------------------------
+// Клиенты как контрагенты: статус и приглашение к ЭДО
+// ---------------------------------------------------------------------------------------------------------------
+
+const CID = 32971;
+const invitePreview = { dry_run: true, organization: "ООО \"Интер\"", customer_name: "НОТИСЕНД", inn: "7017463828", status: "not_invited",
+  status_name: "клиент в Диадоке есть, приглашение не отправлялось", message: "Приглашаем", warnings: [], result: "ready", will: "invite" };
+
+test("приглашение к ЭДО: превью с токеном → отправка без dry_run; другой текст — токен не подходит", async () => {
+  route("POST", `/customers/${CID}/edo/invite`, okEnv(invitePreview));
+  const p = await callTool("invite_customer_to_edo", { customer_id: CID, org_id: ORG_ID });
+  assert.equal(p.isError, undefined);
+  assert.equal(last().body.dry_run, true);
+  assert.equal(last().body.org_id, ORG_ID);
+  const ct = tokenFrom(p);
+  assert.ok(ct);
+  assert.match(textOf(p), /Ничего не отправлено/);
+
+  const bad = await callTool("invite_customer_to_edo", { customer_id: CID, org_id: ORG_ID, message: "иначе", confirm: ct });
+  assert.equal(bad.isError, true);
+
+  route("POST", `/customers/${CID}/edo/invite`, okEnv({ ...invitePreview, dry_run: false, result: "invited", pending: false }));
+  const r = await callTool("invite_customer_to_edo", { customer_id: CID, org_id: ORG_ID, confirm: ct });
+  assert.equal(r.isError, undefined);
+  assert.equal(last().body.dry_run, undefined);
+  assert.match(textOf(r), /Приглашение отправлено/);
+});
+
+test("приглашение к ЭДО: уже партнёр — токена нет", async () => {
+  route("POST", `/customers/${CID}/edo/invite`, okEnv({ ...invitePreview, status: "accepted", status_name: "приглашение принято",
+    result: "exists", will: "nothing", note: "Клиент уже партнёр в Диадоке — приглашать не нужно" }));
+  const p = await callTool("invite_customer_to_edo", { customer_id: CID, org_id: ORG_ID });
+  assert.equal(tokenFrom(p), undefined);
+  assert.match(textOf(p), /уже партнёр/);
+});
+
+test("статус клиента в Диадоке: GET, а refresh — POST …/refresh", async () => {
+  const items = [{ org_id: 1, organization: "ИП Корнев", status: "accepted", status_name: "приглашение принято", accepted_at: "2025-02-11 11:39:22" }];
+  route("GET", `/customers/${CID}/edo`, okEnv({ customer_id: CID, items }));
+  let r = await callTool("get_customer_edo_status", { customer_id: CID });
+  assert.equal(last().method, "GET");
+  assert.match(textOf(r), /с 2025-02-11/);
+  route("POST", `/customers/${CID}/edo/refresh`, okEnv({ customer_id: CID, items }));
+  r = await callTool("get_customer_edo_status", { customer_id: CID, refresh: true });
+  assert.equal(last().method, "POST");
+  assert.equal(last().path, `/customers/${CID}/edo/refresh`);
+});
