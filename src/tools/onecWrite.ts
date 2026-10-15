@@ -79,8 +79,8 @@ const supplierLine = () => z.object({
   line: z.number().int().positive().optional().describe("Номер строки (по умолчанию — по порядку с 1); на него ссылается line_nomenclature"),
   content: z.string().min(1).max(1000).describe("Текст строки — наименование товара или услуги"),
   quantity: z.number().positive().optional().describe("Количество (по умолчанию 1)"),
-  amount: z.number().nonnegative().optional().describe("Сумма строки С НДС — или price"),
-  price: z.number().nonnegative().optional().describe("Цена за единицу С НДС — или amount"),
+  amount: z.number().nonnegative().optional().describe("Сумма строки С НДС (при vat_included=false — БЕЗ НДС) — или price"),
+  price: z.number().nonnegative().optional().describe("Цена за единицу С НДС (при vat_included=false — БЕЗ НДС) — или amount"),
   vat_rate: z.string().min(1).max(20).describe("Ставка НДС: 22, 20, 10, 7, 5, 0, none (без НДС) или код 1С (НДС22, БезНДС…)"),
   vat_amount: z.number().nonnegative().optional().describe("Сумма НДС строки, если известна"),
   nomenclature_id: onecUuid("номенклатуры этой строки").optional(),
@@ -105,7 +105,7 @@ const editItem = () => z.object({
   nomenclature_id: onecUuid("номенклатуры").optional(),
   content: z.string().min(1).max(1000).optional().describe("Текст строки"),
   quantity: z.number().positive().optional().describe("Количество (по умолчанию 1)"),
-  price: z.number().nonnegative().describe("Цена за единицу С НДС"),
+  price: z.number().nonnegative().describe("Цена за единицу С НДС (если у документа «НДС сверху» — vat_included=false — БЕЗ НДС)"),
   vat_rate: z.string().min(1).max(20).describe("Ставка НДС: 22, 20, 10, 7, 5, 0, none (без НДС) или код 1С (НДС22, БезНДС…)"),
   vat_amount: z.number().nonnegative().optional().describe("Сумма НДС строки"),
   accounts: itemAccounts().optional().describe("Счета учёта строки"),
@@ -132,7 +132,9 @@ function supplierDocText(d: any): string {
       ? `Поставщик в 1С: «${cp.name}» ИНН ${cp.inn || "—"}${cp.kpp ? ` КПП ${cp.kpp}` : ""} (id ${cp.id}, ${by[cp.by] || cp.by})`
       : `Поставщик: ${cp.note || "в 1С не найден"}${(cp.candidates || []).length ? `\n${JSON.stringify(cp.candidates)}` : ""}`,
     d.contract ? `Договор: «${d.contract.name ?? ""}» (id ${d.contract.id})` : "",
-    items.length ? `Строк: ${items.length}; сумма ${money(t.sum)}, НДС ${money(t.vat)}${has(t.source_total) ? `; итог документа ${money(t.source_total)}` : ""}` : "",
+    items.length ? `Строк: ${items.length}; сумма ${money(t.sum)}, НДС ${money(t.vat)}` +
+      (d.vat_included === false ? `, всего ${money(t.total)} — НДС сверху (цены без НДС)` : "") +
+      (has(t.source_total) ? `; итог документа ${money(t.source_total)}` : "") : "",
     has(d.post) ? `Проводить: ${d.post ? "да" : "нет"}${has(d.upd) ? `; УПД (со счётом-фактурой): ${d.upd ? "да" : "нет"}` : ""}` : "",
     d.external_id ? `Ключ (external_id): ${d.external_id}` : "",
     ...((d.checks || []) as string[]),
@@ -554,7 +556,9 @@ export function registerOneCWriteTools(server: McpServer) {
       "search_onec_nomenclature, завести — create_onec_nomenclature); у счёта от поставщика — не обязательна, строка пишется " +
       "текстом. Дубли: тот же документ (тот же ключ) вернёт уже созданный; документ с тем же входящим номером у того же " +
       "контрагента (обычно его завёл бухгалтер) — отказ, allow_duplicate=true — только если это точно другой документ. " +
-      "Договор не указан — 1С подставит основной. Проводить (post) — только если об этом явно попросили (по умолчанию нет). " +
+      "Договор не указан — 1С подставит основной. Суммы строк по умолчанию с НДС; vat_included=false — «НДС сверху» (так у " +
+      "налогового агента: иностранный поставщик, НДС начисляет покупатель) — суммы строк без НДС, 1С добавит НДС к ним. " +
+      "Проводить (post) — только если об этом явно попросили (по умолчанию нет). " +
       "ДВУХШАГОВО: без confirm — превью (поставщик, договор, строки, суммы, проверки) и токен, ничего не создаётся; с confirm " +
       "и ТЕМИ ЖЕ полями — запись. Поправить потом — update_onec_document.",
     inputSchema: {
@@ -583,6 +587,8 @@ export function registerOneCWriteTools(server: McpServer) {
       })).max(200).optional().describe("Номенклатура по строкам: [{line, nomenclature_id}] — важнее общей"),
       document_date: date("Дата документа в 1С (по умолчанию — дата документа поставщика)").optional(),
       upd: z.boolean().optional().describe("Поступление: УПД со счётом-фактурой (по умолчанию — по функции УПД Диадока; для manual — нет)"),
+      vat_included: z.boolean().optional()
+        .describe("Сумма включает НДС (по умолчанию true). false — НДС сверху: amount/price строк без НДС, 1С добавит НДС (налоговый агент, иностранный поставщик)"),
       post: z.boolean().optional().describe("Провести в 1С — только если об этом явно попросили (по умолчанию false)"),
       comment: z.string().max(1000).optional().describe("Комментарий в 1С (по умолчанию — откуда документ)"),
       allow_duplicate: z.boolean().optional().describe("Создать, хотя в 1С есть документ с тем же входящим номером у того же контрагента (по умолчанию false)"),
@@ -605,7 +611,8 @@ export function registerOneCWriteTools(server: McpServer) {
     }
     for (const [i, l] of (a.lines || []).entries()) {
       if ((l.amount === undefined) === (l.price === undefined)) {
-        return fail(`lines[${i}]: передайте что-то одно — amount (сумма строки с НДС) или price (цена с НДС).`);
+        const vat = a.vat_included === false ? "без НДС" : "с НДС";
+        return fail(`lines[${i}]: передайте что-то одно — amount (сумма строки ${vat}) или price (цена ${vat}).`);
       }
     }
     const fields = {
@@ -620,7 +627,7 @@ export function registerOneCWriteTools(server: McpServer) {
       })) : null,
       onec_counterparty_id: lc(a.onec_counterparty_id), onec_contract_id: lc(a.onec_contract_id), nomenclature_id: lc(a.nomenclature_id),
       line_nomenclature: a.line_nomenclature ? a.line_nomenclature.map((x) => ({ line: x.line, nomenclature_id: x.nomenclature_id.toLowerCase() })) : null,
-      document_date: a.document_date ?? null, upd: a.upd ?? null, post: a.post ?? false,
+      document_date: a.document_date ?? null, upd: a.upd ?? null, vat_included: a.vat_included ?? null, post: a.post ?? false,
       comment: a.comment?.trim() || null, allow_duplicate: a.allow_duplicate ?? false,
     };
     const { org_id: _org, ...rest } = fields;
@@ -777,9 +784,10 @@ export function registerOneCWriteTools(server: McpServer) {
     title: "Поправить документ поставщика в 1С (с подтверждением)",
     description:
       "Поправить в 1С поступление или счёт от поставщика, СОЗДАННЫЙ ЧЕРЕЗ MCP (create_onec_supplier_document): комментарий, " +
-      "входящий номер и дату, дату документа, договор, строки (items — ЗАМЕНЯЮТ строки целиком: цена с НДС, ставка — код 1С " +
-      "НДС22/БезНДС…, номенклатура, счета учёта строки), счета учёта отдельных строк по номеру (item_accounts — без замены " +
-      "строк), счета расчётов (accounts: settlement, advances), проведение (post — только если об этом явно попросили). " +
+      "входящий номер и дату, дату документа, договор, строки (items — ЗАМЕНЯЮТ строки целиком: цена с НДС, при «НДС сверху» — " +
+      "без НДС, ставка — код 1С НДС22/БезНДС…, номенклатура, счета учёта строки), счета учёта отдельных строк по номеру " +
+      "(item_accounts — без замены строк), счета расчётов (accounts: settlement, advances), «Сумма включает НДС» (vat_included: " +
+      "false — НДС сверху; без items 1С пересчитает НДС строк по текущим ценам), проведение (post — только если об этом явно попросили). " +
       "Остальные документы (бухгалтера, реализации, счета клиентам) не правятся — balance откажет. Проведённый документ после " +
       "правки перепроводится. Нужно хотя бы одно поле. ДВУХШАГОВО: без confirm — документ сейчас (строки, счета) и что " +
       "изменится, токен; с confirm и ТЕМИ ЖЕ полями — запись.",
@@ -792,6 +800,7 @@ export function registerOneCWriteTools(server: McpServer) {
       date: date("Дата документа в 1С").optional(),
       contract_id: onecUuid("договора").optional().describe("Договор с поставщиком (list_onec_contracts)"),
       post: z.boolean().optional().describe("Провести (true) — только если об этом явно попросили"),
+      vat_included: z.boolean().optional().describe("Сумма включает НДС: false — НДС сверху (цены без НДС), true — цены с НДС"),
       items: z.array(editItem()).min(1).max(200).optional().describe("Строки — ЗАМЕНЯЮТ строки документа целиком"),
       item_accounts: z.array(z.object({
         line: z.number().int().positive().describe("Номер строки документа"),
@@ -809,6 +818,7 @@ export function registerOneCWriteTools(server: McpServer) {
     if (a.date !== undefined) ch.date = a.date;
     if (a.contract_id !== undefined) ch.contract_id = a.contract_id.toLowerCase();
     if (a.post !== undefined) ch.post = a.post;
+    if (a.vat_included !== undefined) ch.vat_included = a.vat_included;
     if (a.items !== undefined) {
       ch.items = a.items.map((it) => dropNulls({
         nomenclature_id: lc(it.nomenclature_id), content: it.content?.trim() || null, quantity: it.quantity ?? 1, price: it.price,
@@ -821,7 +831,7 @@ export function registerOneCWriteTools(server: McpServer) {
       .some((o) => o !== undefined && o !== null && !Object.keys(o).length);
     if (emptyAcc) return fail("Счета (accounts) переданы пустым объектом — укажите хотя бы один счёт или уберите поле.");
     if (!Object.keys(ch).length) {
-      return fail("Нечего менять: передайте хотя бы одно поле — comment, incoming_number, incoming_date, date, contract_id, post, items, item_accounts или accounts.");
+      return fail("Нечего менять: передайте хотя бы одно поле — comment, incoming_number, incoming_date, date, contract_id, post, vat_included, items, item_accounts или accounts.");
     }
     const uid = a.onec_id.toLowerCase();
     const fields = { org_id: a.org_id, onec_id: uid, changes: ch };
@@ -840,7 +850,8 @@ export function registerOneCWriteTools(server: McpServer) {
         "date" in ch ? `Дата документа: ${ch.date}` : "",
         "contract_id" in ch ? `Договор: id ${ch.contract_id}` : "",
         "post" in ch ? `Провести: ${ch.post ? "да" : "нет"}` : "",
-        ch.items ? `Строки заменяются целиком: было ${before.length}, станет ${ch.items.length} на ${money(sum)}` : "",
+        "vat_included" in ch ? `Сумма включает НДС: ${ch.vat_included ? "да" : "нет — НДС сверху"}` : "",
+        ch.items ? `Строки заменяются целиком: было ${before.length}, станет ${ch.items.length} на ${money(sum)}${ch.vat_included === false ? " без НДС" : ""}` : "",
         ch.item_accounts ? `Счета учёта строк: ${(ch.item_accounts as any[]).map((x) => `№ ${x.line} — ${accText(x.accounts)}`).join("; ")}` : "",
         ch.accounts ? `Счета расчётов: ${accText(ch.accounts)}` : "",
         d.note,

@@ -174,6 +174,7 @@ test("документ поставщика из Диадока: превью dr
   assert.equal("lines" in b0, false, "строки Диадока не подменяются, если не переданы");
   assert.equal("seller" in b0, false);
   assert.equal("upd" in b0, false);
+  assert.equal("vat_included" in b0, false, "vat_included не передан — balance оставит цены с НДС");
   assert.ok(tokenFrom(p));
   assert.match(textOf(p), /Поставщик в 1С: «ООО Ромашка»/);
   assert.match(textOf(p), /Договор не указан/);
@@ -265,6 +266,34 @@ test("документ поставщика вручную: проверки д�
   assert.match(textOf(w), /onec_duplicate/);
   assert.match(textOf(w), /Уже в 1С:/);
   assert.match(textOf(w), /"number":"88"/);
+});
+
+test("документ поставщика вручную: НДС сверху — vat_included=false в теле, итог в превью, токен привязан к флагу", async () => {
+  const base = { org_id: ORG_ID, source: "manual", kind: "purchase", onec_counterparty_id: UID, onec_contract_id: UID, number: "2026/07-04",
+    date: "2026-07-04", nomenclature_id: NOM, vat_included: false,
+    lines: [{ content: "Услуги удаленного доступа к Платформе CloudAI.am", amount: 666000, vat_rate: "22", vat_amount: 146520 }] };
+  route("POST", `/onec/${ORG_ID}/supplier-documents`, okEnv({ ...docPreview, source: { type: "manual", seller: { inn: "", kpp: "", name: "" } },
+    totals: { sum: 666000, vat: 146520, total: 812520, source_total: null }, vat_included: false,
+    payload: { items: [{ content: "Услуги", quantity: 1, price: 666000, vat_rate: "НДС22", vat_amount: 146520, nomenclature_id: NOM }], vat_included: false },
+    checks: ["НДС сверху (vat_included=false): цены строк без НДС, 1С добавит НДС к сумме"] }));
+  const p = await callTool("create_onec_supplier_document", base);
+  assert.equal(p.isError, undefined, textOf(p));
+  const b = calls[0].body;
+  assert.equal(b.vat_included, false);
+  assert.deepEqual(b.lines, [{ line: 1, content: "Услуги удаленного доступа к Платформе CloudAI.am", quantity: 1, amount: 666000, vat_rate: "22", vat_amount: 146520 }]);
+  assert.match(textOf(p), /сумма 666.000.00, НДС 146.520.00, всего 812.520.00 — НДС сверху/);
+  assert.match(textOf(p), /НДС сверху \(vat_included=false\)/);
+
+  // без флага — другой документ: токен не подходит, в balance не ходим
+  calls = [];
+  const { vat_included: _v, ...noFlag } = base;
+  const bad = await callTool("create_onec_supplier_document", { ...noFlag, confirm: tokenFrom(p) });
+  assert.equal(bad.isError, true);
+  assert.equal(calls.length, 0);
+
+  // ошибка строки говорит о сумме без НДС
+  const both = await callTool("create_onec_supplier_document", { ...base, lines: [{ content: "X", amount: 1, price: 1, vat_rate: "22" }] });
+  assert.match(textOf(both), /amount \(сумма строки без НДС\)/);
 });
 
 // ---------------------------------------------------------------- поставщик и номенклатура
@@ -362,6 +391,18 @@ test("правка документа: PUT с dry_run и только перед
   // другой комментарий — токен не подходит
   const bad = await callTool("update_onec_document", { ...args, comment: "иначе", confirm: tokenFrom(p) });
   assert.equal(bad.isError, true);
+});
+
+test("правка документа: vat_included уходит в PUT и виден в превью", async () => {
+  route("PUT", `/onec/${ORG_ID}/documents/${UID}`, okEnv({ dry_run: true, org_id: ORG_ID,
+    document: { id: UID, kind_name: "Поступление", number: "7", date: "2026-07-04", amount: 666000, posted: false }, items_before: [{}], changes: {},
+    note: "Документ не проведён — останется непроведённым. «Сумма включает НДС» → нет (НДС сверху): если флаг поменяется, 1С пересчитает НДС строк по текущим ценам" }));
+  const p = await callTool("update_onec_document", { org_id: ORG_ID, onec_id: UID, vat_included: false });
+  assert.equal(p.isError, undefined, textOf(p));
+  assert.deepEqual(calls[0].body, { vat_included: false, dry_run: true });
+  assert.match(textOf(p), /Сумма включает НДС: нет — НДС сверху/);
+  assert.match(textOf(p), /пересчитает НДС строк/);
+  assert.ok(tokenFrom(p));
 });
 
 test("правка документа: числовая ставка уходит в balance как есть (нормализует balance)", async () => {
