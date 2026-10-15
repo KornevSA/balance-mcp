@@ -411,3 +411,65 @@ test("СФ налогового агента: старое расширение 
   assert.equal(r.isError, true);
   assert.match(textOf(r), /onec_extension_outdated/);
 });
+
+// ---------------------------------------------------------------- правка оплаты поставщику и договор с иностранным поставщиком
+const PAYX = "05666c82-73a2-11f1-a7fc-00155d013700";
+const IN01 = "04ac68ce-7e95-11f1-a806-00155d013700";
+const CLOUDAI = "09ed6ccb-7388-11f1-a7fc-00155d013700";
+const payDoc = { id: PAYX, kind: "bank_out", kind_name: "Списание с расчетного счета", number: "ИН00-041240", date: "2026-04-10", amount: 536250, posted: true, deleted: false };
+
+test("правка оплаты: превью — dry_run rebind, изменения, проводки и перезаполнение СФ; подтверждение — запись", async () => {
+  route("POST", `/onec/2/documents/${PAYX}/rebind`, (c) => c.body.dry_run ? okEnv({ org_id: 2, dry_run: true, document: payDoc,
+    counterparty_before: { name: "КЛАУДЭЙАЙ ООО" }, contracts_before: ["2026/EE-02 от 10.05.2026"], will: "update", result: "will_change",
+    changes: [{ field: "payments", old: "1: 2026/EE-02 от 10.05.2026 536250.00", new: "1: 2026/IN-01 от 20.03.2026 536250.00" }],
+    entries: [{ debit: "60.02", credit: "51", amount: 536250 }],
+    vat_invoice: { title: "«Счет-фактура выданный» № ИН00-0000957 от 2026-04-10", contract: { name: "2026/IN-01 от 20.03.2026" }, total_vat: 117975, vat_rate: "НДС22_122" },
+    vat_invoice_entries: [{ debit: "76.НА", credit: "68.32", amount: 117975 }], note: "Оплата проведена — после правки будет перепроведена" })
+    : okEnv({ org_id: 2, dry_run: false, result: "updated", after: payDoc, document: payDoc,
+      vat_invoice: { title: "«Счет-фактура выданный» № ИН00-0000957 от 2026-04-10", contract: { name: "2026/IN-01 от 20.03.2026" }, total_vat: 117975 } }));
+  const p = await callTool("update_onec_supplier_payment", { org_id: 2, onec_id: PAYX.toUpperCase(), contract_id: IN01, refill_vat_invoice: true });
+  assert.equal(calls[0].body.dry_run, true);
+  assert.deepEqual(Object.keys(calls[0].body).sort(), ["contract_id", "dry_run", "refill_vat_invoice"]);
+  const t = textOf(p);
+  assert.match(t, /2026\/EE-02 от 10\.05\.2026 536250\.00 → 1: 2026\/IN-01/);
+  assert.match(t, /Дт 60\.02 Кт 51/);
+  assert.match(t, /СФ налогового агента .*ИН00-0000957.*договор 2026\/IN-01/);
+  assert.match(t, /Дт 76\.НА Кт 68\.32/);
+  assert.ok(tokenFrom(p));
+  const r = await callTool("update_onec_supplier_payment", { org_id: 2, onec_id: PAYX, contract_id: IN01, refill_vat_invoice: true, confirm: tokenFrom(p) });
+  assert.equal(r.isError, undefined, textOf(r));
+  assert.equal(calls[1].body.dry_run, undefined);
+  assert.match(textOf(r), /Оплата изменена .* перезаполнен .*ИН00-0000957/);
+});
+
+test("правка оплаты: смена контрагента без договора — отказ без вызова; СФ без refill — 409 от 1С доходит до модели", async () => {
+  const r = await callTool("update_onec_supplier_payment", { org_id: 2, onec_id: PAYX, counterparty_id: CLOUDAI });
+  assert.equal(r.isError, true);
+  assert.equal(calls.length, 0);
+  route("POST", `/onec/2/documents/${PAYX}/rebind`, errEnv(409, "onec_conflict",
+    "Конфликт в 1С: На оплату выписан счёт-фактура налогового агента № ИН00-0000957 от 10.04.2026. Передайте refill_vat_invoice: true"));
+  const r2 = await callTool("update_onec_supplier_payment", { org_id: 2, onec_id: PAYX, contract_id: IN01 });
+  assert.equal(r2.isError, true);
+  assert.match(textOf(r2), /refill_vat_invoice/);
+  assert.equal(tokenFrom(r2), undefined);
+});
+
+test("поставщик без ИНН: договор налогового агента по onec_counterparty_id — признаки агента в теле", async () => {
+  route("POST", "/onec/2/suppliers", okEnv({ org_id: 2, dry_run: true, inn: null, kpp: null, will: "create", result: "absent", warnings: [],
+    counterparty: { id: CLOUDAI, name: "КЛАУДЭЙАЙ ООО", inn: "", result: "exists", country: "АРМЕНИЯ" },
+    contract: { result: "absent", will: "create", note: "Будет заведён договор «С поставщиком» № 2026/IN-02 от 2026-08-20, налоговый агент по НДС" } }));
+  const p = await callTool("create_onec_supplier", { org_id: 2, onec_counterparty_id: CLOUDAI,
+    contract: { number: "2026/IN-02", date: "2026-08-20", tax_agent: true, advance_invoice_nomenclature_id: "04AC68CC-7E95-11F1-A806-00155D013700" } });
+  assert.equal(calls[0].body.onec_counterparty_id, CLOUDAI);
+  assert.equal(calls[0].body.inn, undefined);
+  assert.deepEqual(calls[0].body.contract, { number: "2026/IN-02", date: "2026-08-20", tax_agent: true,
+    advance_invoice_nomenclature_id: "04ac68cc-7e95-11f1-a806-00155d013700" });
+  assert.match(textOf(p), /«КЛАУДЭЙАЙ ООО» без ИНН \(АРМЕНИЯ\)/);
+  assert.match(textOf(p), /налоговый агент по НДС/);
+  assert.ok(tokenFrom(p));
+  const both = await callTool("create_onec_supplier", { org_id: 2, inn: "7707083893", onec_counterparty_id: CLOUDAI, contract: { number: "1", date: "2026-01-01" } });
+  assert.equal(both.isError, true);
+  const noContract = await callTool("create_onec_supplier", { org_id: 2, onec_counterparty_id: CLOUDAI });
+  assert.equal(noContract.isError, true);
+  assert.equal(calls.length, 1, "в balance ходили только за превью");
+});

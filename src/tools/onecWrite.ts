@@ -662,33 +662,51 @@ export function registerOneCWriteTools(server: McpServer) {
   });
 
   server.registerTool("create_onec_supplier", {
-    title: "Поставщик в 1С по ИНН (с подтверждением)",
+    title: "Поставщик в 1С по ИНН и договор с ним (с подтверждением)",
     description:
       "Найти поставщика в базе 1С по ИНН или завести его по ЕГРЮЛ/ЕГРИП (наименование и реквизиты 1С берёт из реестра) и по " +
       "желанию — договор «С поставщиком» (contract: номер и дата; если такой у поставщика уже есть — новый не создаётся). " +
       "Нужен перед create_onec_supplier_document, когда поставщика в 1С нет. Клиента в balance не заводит. Если " +
       "контрагентов с этим ИНН в 1С несколько — ничего не делается: укажите kpp или пусть бухгалтер разберёт дубли. name — " +
-      "только на случай, если реестр недоступен (тогда поставщик заводится по нему). ДВУХШАГОВО: без confirm — превью и " +
-      "токен; с confirm и ТЕМИ ЖЕ полями — запись.",
+      "только на случай, если реестр недоступен (тогда поставщик заводится по нему). Иностранный поставщик без ИНН, который " +
+      "уже есть в 1С, — onec_counterparty_id вместо inn: тогда заводится только договор. Договор с иностранным поставщиком, " +
+      "за которого НДС платим мы (налоговый агент, п. 2 ст. 161 НК), — contract.tax_agent=true (вид «Нерезидент» 1С поставит " +
+      "сама) и contract.advance_invoice_nomenclature_id — номенклатура строки счетов-фактур налогового агента (как у прежнего " +
+      "договора: get_onec_contract → advance_invoice_nomenclature). ДВУХШАГОВО: без confirm — превью и токен; с confirm и ТЕМИ " +
+      "ЖЕ полями — запись.",
     inputSchema: {
       org_id: orgId(),
-      inn: z.string().regex(INN_RE, "10 или 12 цифр").describe("ИНН поставщика"),
+      inn: z.string().regex(INN_RE, "10 или 12 цифр").optional().describe("ИНН поставщика (или onec_counterparty_id)"),
+      onec_counterparty_id: onecUuid("поставщика").optional()
+        .describe("Поставщик, который уже есть в 1С (иностранный без ИНН) — вместо inn; заводится только договор"),
       kpp: z.string().regex(/^\d{9}$/, "9 цифр").optional().describe("КПП — если у ИНН несколько подразделений"),
       name: z.string().min(1).max(100).optional().describe("Наименование — только на случай недоступного ЕГРЮЛ/ЕГРИП"),
       contract: z.object({
         number: z.string().min(1).max(50).describe("Номер договора"),
         date: date("Дата договора"),
         name: z.string().max(100).optional().describe("Наименование договора (по умолчанию 1С сложит из номера и даты)"),
+        tax_agent: z.boolean().optional().describe("Налоговый агент по НДС (иностранный поставщик: НДС платим мы)"),
+        tax_agent_kind: z.string().max(50).optional()
+          .describe("Вид агентского договора 1С: Нерезидент, НерезидентЭлектронныеУслуги, Аренда… (у иностранного поставщика по умолчанию — Нерезидент)"),
+        advance_invoice_nomenclature_id: onecUuid("номенклатуры").optional()
+          .describe("Номенклатура строки счетов-фактур налогового агента («Наименование для счёта-фактуры на аванс»)"),
       }).optional().describe("Договор «С поставщиком», если нужен"),
       confirm: confirm(),
     },
     annotations: WRITE,
   }, async (a, extra) => {
+    if (!a.inn === !a.onec_counterparty_id) return fail("Передайте что-то одно: inn (поставщик по ИНН) или onec_counterparty_id (уже есть в 1С, без ИНН).");
+    if (a.onec_counterparty_id && !a.contract) return fail("По onec_counterparty_id заводится только договор — передайте contract.");
+    const c = a.contract;
     const fields = {
-      org_id: a.org_id, inn: a.inn, kpp: a.kpp ?? null, name: a.name?.trim() || null,
-      contract: a.contract ? { number: a.contract.number.trim(), date: a.contract.date, name: a.contract.name?.trim() || null } : null,
+      org_id: a.org_id, inn: a.inn ?? null, onec_counterparty_id: lc(a.onec_counterparty_id), kpp: a.kpp ?? null, name: a.name?.trim() || null,
+      contract: c ? {
+        number: c.number.trim(), date: c.date, name: c.name?.trim() || null, tax_agent: c.tax_agent ?? null,
+        tax_agent_kind: c.tax_agent_kind?.trim() || null, advance_invoice_nomenclature_id: lc(c.advance_invoice_nomenclature_id),
+      } : null,
     };
-    const body = dropNulls({ inn: fields.inn, kpp: fields.kpp, name: fields.name, contract: fields.contract ? dropNulls(fields.contract) : null });
+    const body = dropNulls({ inn: fields.inn, onec_counterparty_id: fields.onec_counterparty_id, kpp: fields.kpp, name: fields.name,
+      contract: fields.contract ? dropNulls(fields.contract) : null });
     const path = `/onec/${a.org_id}/suppliers`;
     if (!a.confirm) {
       const env = await call(extra, "POST", path, { ...body, dry_run: true });
@@ -697,7 +715,9 @@ export function registerOneCWriteTools(server: McpServer) {
       if (d.result === "ambiguous") return fail(`${d.note}\n${JSON.stringify(d.candidates || [])}`);
       const cp = d.counterparty || {};
       const ct = d.contract;
-      const text = `Поставщик ИНН ${d.inn ?? a.inn}${d.kpp ? ` КПП ${d.kpp}` : ""} в 1С org ${d.org_id ?? a.org_id}:\n` + lines([
+      const inn = d.inn ?? a.inn;
+      const supplier = inn ? `ИНН ${inn}` : `«${cp.name ?? "—"}» без ИНН${cp.country ? ` (${cp.country})` : ""}`;
+      const text = `Поставщик ${supplier}${d.kpp ? ` КПП ${d.kpp}` : ""} в 1С org ${d.org_id ?? a.org_id}:\n` + lines([
         cp.result === "exists"
           ? `Уже есть: «${cp.name}» (id ${cp.id}${cp.kpp ? `, КПП ${cp.kpp}` : ""})`
           : `Не найден — будет заведён по ЕГРЮЛ/ЕГРИП${cp.payload?.external_id ? ` (ключ ${cp.payload.external_id})` : ""}` +
@@ -958,6 +978,72 @@ export function registerOneCWriteTools(server: McpServer) {
       "\nПроверить — get_onec_document (блок vat_invoice); отменить созданную из MCP — set_onec_document_state.";
     return errors ? fail(text) : ok(text, { org_id: a.org_id, items });
   });
+
+  server.registerTool("update_onec_supplier_payment", {
+    title: "Оплата поставщику в 1С: другой контрагент или договор (с подтверждением)",
+    description:
+      "Поправить в 1С оплату поставщику — списание с расчётного счёта из выписки: другой контрагент и/или договор. Например, " +
+      "выписка записала оплату иностранному поставщику на банк-посредник («ФИЛИАЛ ЦЕНТРАЛЬНЫЙ БАНКА ВТБ») или оплата " +
+      "разнесена не на тот договор. Как правка в форме: 1С перезаполняет строки расшифровки (договор, способ погашения, " +
+      "ставку НДС, счета расчётов 60.01/60.02), счёт контрагента — основной счёт нового; сумма и назначение платежа — из банка, не " +
+      "меняются. При смене контрагента нужен contract_id (договор с ним: list_onec_contracts). Если на оплату уже выписан " +
+      "счёт-фактура налогового агента, а договор меняется — 1С откажет, пока не передан refill_vat_invoice=true: тогда СФ " +
+      "перезаполнится по оплате (номер и дата прежние). Нет СФ, а договор агентский — после правки выпишите её: " +
+      "create_onec_tax_agent_invoice. Проведённая оплата перепроводится. ДВУХШАГОВО: без confirm — пробная правка в 1С с " +
+      "откатом (что изменится, проводки оплаты и СФ) и токен; с confirm и ТЕМИ ЖЕ полями — запись.",
+    inputSchema: {
+      org_id: orgId(),
+      onec_id: onecUuid("оплаты (списания с расчётного счёта)"),
+      counterparty_id: onecUuid("нового контрагента").optional().describe("Новый контрагент (search_onec_counterparties); тогда нужен и contract_id"),
+      contract_id: onecUuid("договора").optional().describe("Договор для всех строк оплаты (list_onec_contracts)"),
+      refill_vat_invoice: z.boolean().optional().describe("Перезаполнить СФ налогового агента на эту оплату (по умолчанию false)"),
+      comment: z.string().max(1000).optional().describe("Комментарий в 1С (пустая строка — очистить)"),
+      post: z.boolean().optional().describe("Провести после правки (по умолчанию — как было: проведённая перепроводится)"),
+      confirm: confirm(),
+    },
+    annotations: DESTRUCTIVE,
+  }, async (a, extra) => {
+    if (a.counterparty_id && !a.contract_id) return fail("При смене контрагента нужен contract_id — договор с новым контрагентом (list_onec_contracts).");
+    if (!a.contract_id && a.comment === undefined) return fail("Нечего менять: передайте contract_id (и counterparty_id, если меняется контрагент) или comment.");
+    const ch: Record<string, any> = dropNulls({
+      counterparty_id: lc(a.counterparty_id), contract_id: lc(a.contract_id), refill_vat_invoice: a.refill_vat_invoice ?? null, post: a.post ?? null,
+    });
+    if (a.comment !== undefined) ch.comment = a.comment.trim();
+    const uid = a.onec_id.toLowerCase();
+    const fields = { org_id: a.org_id, onec_id: uid, changes: ch };
+    const path = `/onec/${a.org_id}/documents/${uid}/rebind`;
+    if (!a.confirm) {
+      const env = await call(extra, "POST", path, { ...ch, dry_run: true });
+      if (!env.ok) return onecFail(env);
+      const d = env.data || {};
+      const text = paymentEditText(d);
+      if (d.will === "nothing") return nothingToDo(`${text}\nНичего не изменится.`, d);
+      return preview("onec_payment_rebind", 0, fields, text, d);
+    }
+    const v = verifyConfirmToken(a.confirm, "onec_payment_rebind", 0, fields);
+    if (!v.ok) return badToken("update_onec_supplier_payment", v.reason);
+    const env = await call(extra, "POST", path, ch);
+    if (!env.ok) return onecFail(env);
+    const d = env.data || {};
+    return ok(`Оплата ${d.result === "updated" ? "изменена" : "не изменилась"} в 1С org ${d.org_id ?? a.org_id}: ${docLine(d.after || d.document)}` +
+      (d.vat_invoice ? `; перезаполнен ${d.vat_invoice.title} (договор ${d.vat_invoice.contract?.name ?? "—"}, НДС ${money(d.vat_invoice.total_vat)})` : "") +
+      ". Счёт-фактура налогового агента, если её ещё нет, — create_onec_tax_agent_invoice.", d);
+  });
+}
+
+/** Превью правки оплаты поставщику: было, что изменится, проводки оплаты и СФ налогового агента. */
+function paymentEditText(d: any): string {
+  const ent = (xs: any[]) => (xs || []).map((e) => `Дт ${e.debit} Кт ${e.credit} ${money(e.amount)}`).join("; ");
+  const sf = d.vat_invoice;
+  return `Оплата в 1С org ${d.org_id}: ${docLine(d.document)}\n` + lines([
+    `Сейчас: ${d.counterparty_before?.name ?? "—"}, договор ${(d.contracts_before || []).join(", ") || "—"}`,
+    ...((d.changes || []) as any[]).map((c) => `${c.field}: ${typeof c.old === "object" && c.old ? c.old.name : c.old ?? "—"} → ` +
+      `${typeof c.new === "object" && c.new ? c.new.name : c.new ?? "—"}`),
+    (d.entries || []).length ? `Проводки оплаты после правки: ${ent(d.entries)}` : "",
+    sf ? `СФ налогового агента ${sf.title}: договор ${sf.contract?.name ?? "—"}, НДС ${money(sf.total_vat)} (${sf.vat_rate ?? "—"})` +
+      ((d.vat_invoice_entries || []).length ? `; проводки: ${ent(d.vat_invoice_entries)}` : "") : "",
+    d.note,
+  ]);
 }
 
 /** Текст ошибки из результата fail() — для сводки по нескольким оплатам. */
