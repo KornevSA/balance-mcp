@@ -336,3 +336,78 @@ test("обрыв по тайм-ауту записи — текст «запис
     hang.close();
   }
 });
+
+// ---------------------------------------------------------------- счёт-фактура налогового агента
+const PAY1 = "f4c84f2b-a341-11f1-a825-00155d017501";
+const PAY2 = "f4c84f2c-a341-11f1-a825-00155d017501";
+const taPayment = (id: string, n: string) => ({ id, kind: "bank_out", kind_name: "Списание с расчетного счета", number: n, date: "2026-07-22",
+  amount: 675000, title: `«Списание с расчетного счета» № ${n} от 2026-07-22`, counterparty: { name: "КЛАУДЭЙАЙ ООО" }, contracts: ["2026/EE-02 от 10.05.2026"] });
+const taDoc = (n: string) => ({ id: "e76b97cd-bc2e-c17b-f0f3-be0a2e9c72cf", kind: "vat_invoice", kind_name: "Счет-фактура выданный", number: n,
+  date: "2026-07-22", amount: 823500, posted: true, deleted: false, type_name: "Налоговый агент", operation_code: "06", vat_rate: "НДС22_122",
+  total: 823500, total_vat: 148500, contract: { name: "2026/EE-02 от 10.05.2026" }, responsible: "KornevSA", head: "Корнев Николай Александрович",
+  advances: [{ line: 1, nomenclature: "Доступ к моделям искусственного интеллекта", content: "Доступ к моделям искусственного интеллекта",
+    amount: 823500, vat_rate: "НДС22_122", vat_amount: 148500 }] });
+const taPreview = (id: string, n: string, exists = false) => okEnv({ org_id: 2, dry_run: true, kind: "vat_invoice", external_id: `tax-agent:${id}`,
+  payment: taPayment(id, n), document: taDoc(exists ? "ИН00-0001316" : "ИН00-0002558"),
+  ...(exists ? { result: "exists", will: "nothing", note: "На эту оплату счёт-фактура налогового агента уже есть (выписана в 1С не из MCP) — ничего не создаётся" }
+    : { result: "absent", will: "create", entries: [{ debit: "76.НА", credit: "68.32", amount: 148500 }], warnings: [] }) });
+
+test("СФ налогового агента: превью по двум оплатам — dry_run на каждую, токен, текст с заполнением 1С", async () => {
+  route("POST", "/onec/2/tax-agent-invoices", (c) => c.body.payment_id === PAY1 ? taPreview(PAY1, "ИН00-043000") : taPreview(PAY2, "ИН00-043001", true));
+  const r = await callTool("create_onec_tax_agent_invoice", { org_id: 2, payment_ids: [PAY1.toUpperCase(), PAY2, PAY1] });
+  assert.equal(calls.length, 2, "повтор id в списке — один вызов");
+  assert.deepEqual(calls.map((c) => c.body.payment_id), [PAY1, PAY2]);
+  assert.ok(calls.every((c) => c.body.dry_run === true && c.body.post === true), "dry_run и post=true по умолчанию");
+  assert.ok(calls.every((c) => !("content" in c.body) && !("nomenclature_id" in c.body)), "необязательные поля не уходят");
+  assert.ok(tokenFrom(r));
+  const t = textOf(r);
+  assert.match(t, /«Налоговый агент», код операции 06/);
+  assert.match(t, /НДС 148\s?500,00 \(НДС22_122\)/);
+  assert.match(t, /Дт 76\.НА Кт 68\.32/);
+  assert.match(t, /уже есть/);
+  assert.match(t, /Будет выписано: 1, с проведением/);
+  assert.match(t, /Ничего не записано/);
+});
+
+test("СФ налогового агента: подтверждение — запись по каждой оплате; изменили поля — токен не подходит", async () => {
+  route("POST", "/onec/2/tax-agent-invoices", (c) => {
+    if (c.body.dry_run) return taPreview(c.body.payment_id, "ИН00-043000");
+    return okEnv({ org_id: 2, dry_run: false, result: "created", payment: taPayment(c.body.payment_id, "ИН00-043000"),
+      document: taDoc("ИН00-0002558"), warnings: [] }, 200);
+  });
+  const p = await callTool("create_onec_tax_agent_invoice", { org_id: 2, payment_ids: [PAY1, PAY2], content: "Доступ к моделям" });
+  const bad = await callTool("create_onec_tax_agent_invoice", { org_id: 2, payment_ids: [PAY1], content: "Доступ к моделям", confirm: tokenFrom(p) });
+  assert.equal(bad.isError, true);
+  assert.match(textOf(bad), /Токен подтверждения не совпал/);
+  calls = [];
+  const r = await callTool("create_onec_tax_agent_invoice", { org_id: 2, payment_ids: [PAY1, PAY2], content: "Доступ к моделям", confirm: tokenFrom(p) });
+  assert.equal(r.isError, undefined, textOf(r));
+  assert.equal(calls.length, 2);
+  assert.ok(calls.every((c) => c.body.dry_run === undefined && c.body.content === "Доступ к моделям"));
+  assert.match(textOf(r), /выписано 2, уже было 0/);
+});
+
+test("СФ налогового агента: на все оплаты СФ уже есть — без токена", async () => {
+  route("POST", "/onec/2/tax-agent-invoices", (c) => taPreview(c.body.payment_id, "ИН00-042162", true));
+  const r = await callTool("create_onec_tax_agent_invoice", { org_id: 2, payment_ids: [PAY1] });
+  assert.equal(tokenFrom(r), undefined);
+  assert.match(textOf(r), /Подтверждать нечего/);
+});
+
+test("СФ налогового агента: отказ 1С по одной оплате — без токена, причина и код в тексте", async () => {
+  route("POST", "/onec/2/tax-agent-invoices", (c) => c.body.payment_id === PAY1 ? taPreview(PAY1, "ИН00-043000")
+    : errEnv(422, "onec_rejected", "1С отказала: В оплате № ИН00-042431 от 03.08.2026 нет договора с признаком налогового агента по НДС"));
+  const r = await callTool("create_onec_tax_agent_invoice", { org_id: 2, payment_ids: [PAY1, PAY2] });
+  assert.equal(r.isError, true);
+  assert.equal(tokenFrom(r), undefined);
+  assert.match(textOf(r), /нет договора с признаком налогового агента/);
+  assert.match(textOf(r), /onec_rejected/);
+  assert.match(textOf(r), /По 1 опл\. 1С отказала/);
+});
+
+test("СФ налогового агента: старое расширение 1С — 501 доходит до модели", async () => {
+  route("POST", "/onec/2/tax-agent-invoices", errEnv(501, "onec_extension_outdated", "Расширение BalanceAPI в базе 1С этой организации старое"));
+  const r = await callTool("create_onec_tax_agent_invoice", { org_id: 2, payment_ids: [PAY1] });
+  assert.equal(r.isError, true);
+  assert.match(textOf(r), /onec_extension_outdated/);
+});

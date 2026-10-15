@@ -12,6 +12,9 @@
 // Документы поставщиков (задача пользователя 13.10.2026, balance class/onec_api_supplier.php, право onec.write):
 // поступление или счёт от поставщика из входящего документа Диадока или из данных пользователя, поставщик по ИНН
 // с договором, номенклатура и правка такого документа (PUT). Чтение Диадока — edo.ts.
+//
+// Счёт-фактура налогового агента (задача 15.10.2026, balance POST /onec/{org}/tax-agent-invoices): на оплату иностранному
+// поставщику, как «Создать на основании» у бухгалтера; превью — пробная запись 1С с откатом по каждой оплате.
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -865,4 +868,120 @@ export function registerOneCWriteTools(server: McpServer) {
     const d = env.data || {};
     return ok(`Изменён в 1С org ${d.org_id ?? a.org_id}: ${docLine(d.summary || d.document)} (было: ${docLine(d.before)}).`, d);
   });
+
+  server.registerTool("create_onec_tax_agent_invoice", {
+    title: "Счёт-фактура налогового агента в 1С на оплату иностранному поставщику (с подтверждением)",
+    description:
+      "Выписать в 1С счёт-фактуру налогового агента на оплату иностранному поставщику (НДС за нерезидента, п. 2 ст. 161 НК) — " +
+      "так же, как бухгалтер: «Создать на основании → Счёт-фактура выданный» из списания с расчётного счёта. 1С заполняет " +
+      "сама: вид «Налоговый агент», код операции 06, договор и НДС сверху по проводкам оплаты (с 2026 — 22/122), «не " +
+      "выставляется»; номенклатура строки — из договора или как у прежних таких СФ по договору. Нужны id оплат в 1С — " +
+      "списаний с расчётного счёта (list_onec_documents kind=bank_out по контрагенту; get_onec_document оплаты покажет, есть ли " +
+      "уже СФ — поле vat_invoice). Оплата должна быть проведена и по договору с признаком налогового агента. На оплату — одна " +
+      "СФ: уже выписанная (бухгалтером или из MCP) не задваивается. Проводится по умолчанию: без проведения НДС не " +
+      "начисляется. До 20 оплат за вызов. ДВУХШАГОВО: без confirm — пробная запись в 1С с откатом (как 1С заполнит каждую СФ, " +
+      "проводки, предупреждения) и токен, ничего не создаётся; с confirm и ТЕМИ ЖЕ полями — запись. Отменить созданную из " +
+      "MCP — set_onec_document_state (delete).",
+    inputSchema: {
+      org_id: orgId(),
+      payment_ids: z.array(onecUuid("оплаты поставщику — списания с расчётного счёта")).min(1).max(20)
+        .describe("id оплат (списаний с р/с) в 1С, на каждую — своя СФ"),
+      nomenclature_id: onecUuid("номенклатуры").optional()
+        .describe("Номенклатура строки СФ (по умолчанию — из договора: «наименование для СФ на аванс», иначе как у прежних СФ по договору)"),
+      content: z.string().min(1).max(1000).optional()
+        .describe("Содержание строки (по умолчанию — как у прежних СФ по договору или полное наименование номенклатуры)"),
+      date: date("Дата СФ — одна на все оплаты, не раньше оплаты (по умолчанию — дата каждой оплаты; обычно не передают)").optional(),
+      comment: z.string().max(1000).optional().describe("Комментарий в 1С"),
+      post: z.boolean().optional().describe("Провести (по умолчанию true: без проведения НДС не начисляется)"),
+      confirm: confirm(),
+    },
+    annotations: WRITE,
+  }, async (a, extra) => {
+    const ids = [...new Set(a.payment_ids.map((x) => x.toLowerCase()))];
+    const fields = {
+      org_id: a.org_id, payment_ids: ids, nomenclature_id: lc(a.nomenclature_id), content: a.content?.trim() || null,
+      date: a.date ?? null, comment: a.comment?.trim() || null, post: a.post ?? true,
+    };
+    const { org_id: _org, payment_ids: _ids, ...rest } = fields;
+    const common = dropNulls(rest);
+    const path = `/onec/${a.org_id}/tax-agent-invoices`;
+
+    if (!a.confirm) {
+      const items: any[] = [];
+      const texts: string[] = [];
+      let errors = 0;
+      for (const id of ids) {
+        const env = await call(extra, "POST", path, { payment_id: id, ...common, dry_run: true });
+        if (!env.ok) {
+          errors++;
+          texts.push(`Оплата ${id}: ✖ ${textOfFail(onecFail(env))}`);
+          items.push({ payment_id: id, error: env.error ?? null });
+          continue;
+        }
+        items.push(env.data || {});
+        texts.push(taxAgentText(env.data || {}));
+      }
+      const head = `Счета-фактуры налогового агента в 1С org ${a.org_id} — пробная запись с откатом, ${ids.length} опл.:\n`;
+      const data = { org_id: a.org_id, items };
+      if (errors) {
+        return fail(`${head}${texts.join("\n\n")}\n\nПо ${errors} опл. 1С отказала — уберите их из payment_ids или исправьте в 1С и вызовите снова. Ничего не записано.`);
+      }
+      const toCreate = items.filter((d) => d.will === "create").length;
+      if (!toCreate) return nothingToDo(`${head}${texts.join("\n\n")}\nНа все оплаты счета-фактуры уже есть.`, data);
+      return preview("onec_tax_agent_invoice", 0, fields, `${head}${texts.join("\n\n")}\n\nБудет выписано: ${toCreate}` +
+        (fields.post ? ", с проведением" : ", без проведения") + ".", data);
+    }
+
+    const v = verifyConfirmToken(a.confirm, "onec_tax_agent_invoice", 0, fields);
+    if (!v.ok) return badToken("create_onec_tax_agent_invoice", v.reason);
+    const items: any[] = [];
+    const texts: string[] = [];
+    let errors = 0;
+    for (const id of ids) {
+      const env = await call(extra, "POST", path, { payment_id: id, ...common });
+      if (!env.ok) {
+        errors++;
+        texts.push(`Оплата ${id}: ✖ ${textOfFail(onecFail(env))}`);
+        items.push({ payment_id: id, error: env.error ?? null });
+        continue;
+      }
+      const d = env.data || {};
+      items.push(d);
+      const doc = d.document || {};
+      texts.push(`${d.result === "created" ? "Выписан" : "Уже был"}: ${docLine(doc)}, НДС ${money(doc.total_vat)} (id ${doc.id ?? d.onec_id}) — ` +
+        `на оплату ${d.payment?.title ?? id}` + ((d.warnings || []).length ? `\n  ⚠ ${(d.warnings as string[]).join("\n  ⚠ ")}` : ""));
+    }
+    const created = items.filter((d) => d.result === "created").length;
+    const text = `Счета-фактуры налогового агента в 1С org ${a.org_id}: выписано ${created}, уже было ${items.length - created - errors}` +
+      (errors ? `, ошибок ${errors}` : "") + ".\n" + lines(texts) +
+      (errors ? "\nПовтор безопасен: на оплату, где СФ уже выписана, вторая не создаётся." : "") +
+      "\nПроверить — get_onec_document (блок vat_invoice); отменить созданную из MCP — set_onec_document_state.";
+    return errors ? fail(text) : ok(text, { org_id: a.org_id, items });
+  });
+}
+
+/** Текст ошибки из результата fail() — для сводки по нескольким оплатам. */
+function textOfFail(r: any): string {
+  return String(r?.content?.[0]?.text ?? "Ошибка");
+}
+
+/** Пробная СФ налогового агента (превью balance) — одной строкой с подробностями. */
+function taxAgentText(d: any): string {
+  const p = d.payment || {};
+  const doc = d.document || {};
+  const pay = `Оплата ${p.title ?? "—"} на ${money(p.amount)}${p.counterparty?.name ? `, ${p.counterparty.name}` : ""}` +
+    ((p.contracts || []).length ? `, договор ${(p.contracts as string[]).join(", ")}` : "");
+  if (d.will === "nothing") return `${pay}\n  → ${d.note ?? "СФ уже есть"}: ${docLine(doc)} (id ${doc.id ?? "—"})`;
+  const rows = ((doc.advances || []) as any[]).map((r) =>
+    `«${r.content || r.nomenclature || "без содержания"}» ${money(r.amount)}, НДС ${money(r.vat_amount)} (${r.vat_rate ?? "—"})` +
+    (r.nomenclature && r.nomenclature !== r.content ? `, номенклатура «${r.nomenclature}»` : ""));
+  const entries = ((d.entries || []) as any[]).map((e) => `Дт ${e.debit} Кт ${e.credit} ${money(e.amount)}`);
+  return `${pay}\n` + lines([
+    `СФ «${doc.type_name ?? "—"}», код операции ${doc.operation_code ?? "—"}, от ${doc.date ?? "—"}: ${money(doc.total)}, НДС ${money(doc.total_vat)} (${doc.vat_rate ?? "—"})` +
+      (doc.contract?.name ? `, договор ${doc.contract.name}` : ""),
+    ...rows.map((r) => `Строка: ${r}`),
+    entries.length ? `Проводки: ${entries.join("; ")}` : "",
+    doc.responsible ? `Ответственный ${doc.responsible}${doc.head ? `, руководитель ${doc.head}` : ""}` : "",
+    ...((d.warnings || []) as string[]).map((w) => `⚠ ${w}`),
+  ]);
 }
