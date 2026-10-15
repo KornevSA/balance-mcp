@@ -1,10 +1,12 @@
-// Тулзы ЭДО (Диадок) — ЧТЕНИЕ (задача пользователя 13.10.2026).
+// Тулзы ЭДО (Диадок, Saby) — ЧТЕНИЕ (задача пользователя 13.10.2026, Saby — 16.10.2026).
 //
-// MCP в Диадок не ходит: тулзы зовут balance /api/v1/edo/…, а balance сам берёт ящик организации, ключи
-// Диадока и проверяет скоуп onec:read, право onec.view (пользователю с зоной дилера — 403: ящик организации —
-// сквозной список). Документы читаются живьём из Диадока; у входящих balance ищет, заведены ли они в 1С —
-// по ключу diadoc:<MessageId>:<EntityId> (так создаёт balance) или по входящему номеру у контрагента с тем же
-// ИНН (так заводит бухгалтер). Создание в 1С — create_onec_supplier_document (onecWrite.ts).
+// MCP в Диадок и Saby не ходит: тулзы зовут balance /api/v1/edo/…, а balance сам берёт ящик организации, ключи
+// и проверяет скоуп onec:read, право onec.view (пользователю с зоной дилера — 403: ящик организации —
+// сквозной список). Документы Диадока читаются живьём; входящие Saby balance дочитывает с курсора
+// (СБИС.СписокИзменений) и отдаёт из своей таблицы, документ целиком — живьём. У входящих balance ищет, заведены
+// ли они в 1С — по ключу diadoc:<MessageId>:<EntityId> или saby:<документ>:<вложение> (так создаёт balance) или по
+// входящему номеру у контрагента с тем же ИНН (так заводит бухгалтер). Создание в 1С — create_onec_supplier_document
+// (onecWrite.ts).
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { balanceCall, type Envelope } from "../balanceClient.js";
@@ -24,7 +26,13 @@ const TYPE_NAMES: Record<string, string> = {
   ProformaInvoice: "Счёт",
   XmlAcceptanceCertificate: "Акт",
   Nonformalized: "Неформализованный документ",
+  // типы вложений Saby
+  УпдСчфДоп: "УПД",
+  УпдДоп: "УПД (передаточный)",
+  УпдСчф: "Счёт-фактура (УПД)",
+  СчФктр: "Счёт-фактура",
 };
+const sabyGuid = (what: string) => z.string().regex(UUID_RE, "GUID Saby").describe(`${what} (из list_saby_documents)`);
 
 /** GET к balance с тайм-аутом для Диадока и 1С. */
 function get(extra: any, path: string): Promise<Envelope> {
@@ -57,12 +65,13 @@ function onecText(o: any, inn?: string): string {
 
 export function registerEdoTools(server: McpServer) {
   server.registerTool("get_edo_status", {
-    title: "ЭДО (Диадок): подключение и ящики",
+    title: "ЭДО (Диадок, Saby): подключение и ящики",
     description:
       "Подключение balance к Диадоку: настроено ли (configured), ящики организаций — у какого ящика есть доступ к API " +
       "(api_ok; без него документы ящика не читаются, причина — в note), и последняя фоновая синхронизация пометок «ушёл " +
       "через ЭДО» у документов balance (включена ли, за сколько дней смотрит, когда запускалась, последняя ошибка, " +
-      "статистика). Вызывайте первым, чтобы выбрать org_id для list_diadoc_documents. Секреты не отдаются.",
+      "статистика). То же для Saby (СБИС): настроен ли, наши организации в учётке Saby — есть ли документооборот, сколько " +
+      "входящих прочитано. Вызывайте первым, чтобы выбрать org_id для list_diadoc_documents / list_saby_documents. Секреты не отдаются.",
     inputSchema: {},
     annotations: READ_ONLY,
   }, async (_a, extra) => {
@@ -74,8 +83,14 @@ export function registerEdoTools(server: McpServer) {
     const sync = d.sync_enabled
       ? `включена (за ${d.sync_days} дн.)${d.last_run_at ? `, последний запуск ${d.last_run_at}` : ""}${d.last_error ? `, ошибка: ${d.last_error}` : ""}`
       : "выключена";
+    const sb = d.providers?.saby;
+    const sabyText = !sb ? "" : !sb.installed ? "\nSaby: в balance не установлено (миграция 167)." :
+      `\nSaby: ${sb.configured ? "подключён" : "НЕ настроен («Настройки → ЭДО (Диадок, Saby)»)"}${sb.last_error ? `, последняя ошибка: ${sb.last_error}` : ""}. ` +
+      `Организации: ${((sb.organizations || []) as any[]).map((o) => `org ${o.org_id} «${o.organization || o.saby_name}»: ` +
+        (o.edo_ok ? `документооборот есть, входящих прочитано ${o.incoming_docs ?? 0}` : `нет документооборота${o.note ? ` — ${o.note}` : ""}`)).join("; ") ||
+        "ещё не найдены (найдутся при первом list_saby_documents)"}.`;
     return ok(`Диадок: ${d.configured ? "подключён" : "НЕ настроен («Настройки → ЭДО (Диадок)»)"}; ` +
-      `синхронизация пометок «ушёл через ЭДО»: ${sync}. Ящики: ${boxes || "нет"}.`, d);
+      `синхронизация пометок «ушёл через ЭДО»: ${sync}. Ящики: ${boxes || "нет"}.${sabyText}`, d);
   });
 
   server.registerTool("list_diadoc_documents", {
@@ -156,6 +171,84 @@ export function registerEdoTools(server: McpServer) {
       lns ? `Строк: ${lns.length}; итого ${money(t.total)}${t.vat !== null && t.vat !== undefined ? `, НДС ${money(t.vat)}` : ""}` : `Строк нет: ${d.parse_note || "не разобраны"}`,
       d.direction === "in" ? `В 1С: ${d.onec ? onecText(d.onec, seller.inn) : "не проверялся"}; вид документа 1С по умолчанию — ${d.onec_kind === "supplier_invoice" ? "счёт от поставщика" : "поступление"}` : "",
       d.balance_doc_id ? `Документ balance #${d.balance_doc_id}` : "",
+    ].filter(Boolean).join("\n");
+    return ok(out, d);
+  });
+
+  // ---------------------------------------------------------------------------------------------- Saby
+  server.registerTool("list_saby_documents", {
+    title: "Входящие документы в Saby (СБИС)",
+    description:
+      "Входящие УПД и акты поставщиков (тип Saby ДокОтгрВх) организации в Saby (СБИС) — например, ежемесячные акты ООО «БК». " +
+      "balance сначала дочитывает новые события Saby с прошлого раза, потом отбирает документы по дате документа (без from — " +
+      "последние 90 дней; раньше уже прочитанного — перечитает с этой даты). Одна строка — один документ: document_id и " +
+      "attachment_id основного вложения (УПД), номер, дата, сумма, НДС, контрагент, состояние документооборота. По умолчанию " +
+      "balance проверяет, заведён ли каждый в 1С (onec.status: found — есть, absent — нет, no_counterparty — поставщика с таким " +
+      "ИНН в 1С нет; onec.matches — найденные документы 1С). Порядок: not_in_onec=true — только ещё не заведённые → " +
+      "get_saby_document (строки УПД) → create_onec_supplier_document с source=saby (поставщика нет в 1С — сначала " +
+      "create_onec_supplier). Исходящие Saby не читаются. Удалённые не показываются.",
+    inputSchema: {
+      org_id: z.number().int().positive().describe("Организация: org_id из get_edo_status (providers.saby.organizations; он же база 1С)"),
+      from: date("С даты документа (по умолчанию 90 дней назад)").optional(),
+      to: date("По дату документа (по умолчанию без ограничения)").optional(),
+      counteragent_inn: z.string().regex(/^\d{10}(\d{2})?$/, "10 или 12 цифр").optional().describe("Только документы контрагента с этим ИНН"),
+      limit: z.number().int().min(1).max(200).optional().describe("Сколько документов вернуть, 1–200 (по умолчанию 50)"),
+      onec_check: z.boolean().optional().describe("Проверить, есть ли каждый в 1С (по умолчанию true; false — быстрее, без 1С)"),
+      not_in_onec: z.boolean().optional().describe("Только те, которых в 1С ещё нет (status absent или no_counterparty); проверку в 1С включает сам"),
+    },
+    annotations: READ_ONLY,
+  }, async (a, extra) => {
+    if (a.from && a.to && a.from > a.to) return fail("from позже to.");
+    const check = a.onec_check !== false || !!a.not_in_onec;
+    const env = await get(extra, "/edo/documents" + qs({
+      provider: "saby", org_id: a.org_id, from: a.from, to: a.to, counteragent_inn: a.counteragent_inn, limit: a.limit,
+      onec_check: check ? 1 : undefined, not_in_onec: a.not_in_onec ? 1 : undefined,
+    }));
+    if (!env.ok) return onecFail(env);
+    const d = env.data || {};
+    const items: any[] = d.items || [];
+    const n = (s: string) => items.filter((it) => it.onec?.status === s).length;
+    const tail = !check ? "" : a.not_in_onec ? `; все — нет в 1С (из них поставщика нет в 1С: ${n("no_counterparty")})`
+      : `; нет в 1С: ${n("absent")}, уже в 1С: ${n("found")}, поставщика нет в 1С: ${n("no_counterparty")}`;
+    const rows = items.slice(0, 30).map((it) => `• ${edoLine(it)}${check ? ` — ${onecText(it.onec, it.counteragent?.inn)}` : ""}` +
+      `${it.attachment_id ? "" : " (вложения ещё нет)"}`);
+    return ok(`Входящие Saby org ${d.org_id ?? a.org_id}${d.organization ? ` «${d.organization}»` : ""} (${d.from ?? a.from ?? "—"} — ${d.to ?? a.to ?? "…"}): ` +
+      `${items.length}${tail}.${d.has_more ? "\nЕсть ещё документы — увеличьте limit или сузьте период." : ""}${d.note ? `\n⚠ ${d.note}` : ""}` +
+      (rows.length ? "\n" + rows.join("\n") : ""), d);
+  });
+
+  server.registerTool("get_saby_document", {
+    title: "Документ Saby со строками",
+    description:
+      "Один входящий документ Saby (СБИС) целиком: реквизиты, состояние документооборота, основание (договор), вложения, " +
+      "продавец и покупатель, строки УПД из XML вложения (lines: наименование, код, единица, количество, цена, сумма без НДС, " +
+      "ставка и сумма НДС, сумма, услуга ли), итоги (totals) и вид документа 1С (onec_kind: purchase — поступление). " +
+      "attachment_id не передан — основное вложение (УПД). Неформализованные вложения (скан, PDF) строк не дают (lines=null, " +
+      "причина — parse_note). Заведён ли уже в 1С — onec (как в list_saby_documents; onec_check=false — не проверять). " +
+      "Следующий шаг — create_onec_supplier_document с source=saby и этими document_id и attachment_id.",
+    inputSchema: {
+      org_id: z.number().int().positive().describe("Организация: org_id из get_edo_status (providers.saby.organizations)"),
+      document_id: sabyGuid("document_id документа Saby"),
+      attachment_id: sabyGuid("attachment_id вложения").optional(),
+      onec_check: z.boolean().optional().describe("Проверить, есть ли документ в 1С (по умолчанию true)"),
+    },
+    annotations: READ_ONLY,
+  }, async (a, extra) => {
+    const path = `/edo/documents/${a.document_id.toLowerCase()}${a.attachment_id ? `/${a.attachment_id.toLowerCase()}` : ""}` +
+      qs({ provider: "saby", org_id: a.org_id, onec_check: a.onec_check === false ? 0 : undefined });
+    const env = await get(extra, path);
+    if (!env.ok) return onecFail(env);
+    const d = env.data || {};
+    const t = d.totals || {};
+    const seller = d.seller || d.counteragent || {};
+    const lns: any[] | null = Array.isArray(d.lines) ? d.lines : null;
+    const out = [
+      `Входящий ${edoLine(d)}${d.title ? ` («${d.title}»)` : ""}; в Saby: ${d.status_text || d.state || "—"}${d.grounds ? `; основание: ${d.grounds}` : ""}`,
+      lns ? `Строк: ${lns.length}; итого ${money(t.total)}${t.vat !== null && t.vat !== undefined ? `, НДС ${money(t.vat)}` : ""}\n` +
+        lns.map((l) => `  ${l.line}. ${l.name} — ${money(l.amount)} (${l.vat_rate || "—"}${l.vat_amount ? `, НДС ${money(l.vat_amount)}` : ""})`).join("\n")
+        : `Строк нет: ${d.parse_note || "не разобраны"}`,
+      `В 1С: ${d.onec ? onecText(d.onec, seller.inn) : "не проверялся"}; вид документа 1С по умолчанию — поступление`,
+      d.attachment_id ? `Создать: create_onec_supplier_document, source=saby, document_id=${d.document_id}, attachment_id=${d.attachment_id}` : "",
     ].filter(Boolean).join("\n");
     return ok(out, d);
   });

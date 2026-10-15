@@ -119,7 +119,7 @@ export function registerOneCTools(server: McpServer) {
       "запись — отдельные тулзы с подтверждением (create_onec_* — в том числе документы поставщиков, поставщики и " +
       "номенклатура, fill_onec_*, update_onec_document, send_document_to_onec, pull_onec_bank_payments, " +
       "set_onec_document_state). Входящие документы поставщиков из Диадока — get_edo_status, list_diadoc_documents, " +
-      "get_diadoc_document.",
+      "get_diadoc_document; из Saby (СБИС) — list_saby_documents, get_saby_document.",
     inputSchema: {},
     annotations: READ_ONLY,
   }, async (_a, extra) => {
@@ -294,7 +294,7 @@ export function registerOneCTools(server: McpServer) {
       onec_id: onecUuid("документа").optional(),
       doc_id: z.number().int().positive().optional().describe("id документа в balance"),
       kind: z.enum(KINDS).optional().describe("Вид документа — вместе с external_id"),
-      external_id: z.string().max(100).optional().describe("Ключ документа, созданного через API 1С (balance:act:N, routerai:tx:N, diadoc:<message_id>:<entity_id> — документ поставщика из Диадока…)"),
+      external_id: z.string().max(100).optional().describe("Ключ документа, созданного через API 1С (balance:act:N, routerai:tx:N, diadoc:<message_id>:<entity_id> — документ поставщика из Диадока, saby:<document_id>:<attachment_id> — из Saby…)"),
     },
     annotations: READ_ONLY,
   }, async (a, extra) => {

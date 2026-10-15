@@ -1,4 +1,4 @@
-// Тесты тулзов ЭДО (Диадок, чтение) и документов поставщиков в 1С (запись с подтверждением):
+// Тесты тулзов ЭДО (Диадок и Saby, чтение) и документов поставщиков в 1С (запись с подтверждением):
 // подменный balance (http-сервер) + перехват обработчиков тулзов, как в onecWrite.test.ts.
 // Запуск: npm test (tsc -p tsconfig.test.json && node --test build-test/test/).
 import { test, before, after, beforeEach } from "node:test";
@@ -139,6 +139,77 @@ test("get_edo_status и ошибка Диадока с кодом", async () => 
   assert.match(textOf(r), /mcp-e/);
 });
 
+// ---------------------------------------------------------------- Saby: чтение
+const SDOC = "4AC90234-2931-4697-B493-5E1A955EC100";
+const SATT = "01A114CF-BDB1-7626-9290-BC4AE335A763";
+const sabyItem = (status: string, n: string) => ({ provider: "saby", document_id: SDOC.toLowerCase(), attachment_id: SATT.toLowerCase(),
+  external_id: `saby:${SDOC.toLowerCase()}:${SATT.toLowerCase()}`, direction: "in", doc_type: "ДокОтгрВх", type: "УпдСчфДоп", function: "СЧФДОП",
+  number: n, date: "2026-09-30", total: 5718774, vat: 1029331, counteragent: { inn: "7805733652", kpp: "780701001", name: "БК, ООО" },
+  state: "signed", status_text: "Выполнение завершено успешно", deleted: false,
+  onec: { status, matches: status === "found" ? [{ id: UID, kind_name: "Поступление", number: "0000-000047", date: "2026-09-30", amount: 5718774,
+    by: "incoming_number", incoming_number: "1639" }] : [], counterparties: [] } });
+
+test("list_saby_documents: provider=saby, проверка в 1С по умолчанию, строки с отметкой «в 1С»", async () => {
+  route("GET", "/edo/documents", okEnv({ provider: "saby", org_id: 3, organization: "Нотисенд, ООО", from: "2026-08-01", to: null,
+    items: [sabyItem("found", "1639"), { ...sabyItem("absent", "1700"), attachment_id: null }], has_more: false, note: null }));
+  const r = await callTool("list_saby_documents", { org_id: 3, from: "2026-08-01", counteragent_inn: "7805733652" });
+  assert.equal(r.isError, undefined, textOf(r));
+  const q = query(calls[0]);
+  assert.equal(q.get("provider"), "saby");
+  assert.equal(q.get("org_id"), "3");
+  assert.equal(q.get("onec_check"), "1");
+  assert.equal(q.get("from"), "2026-08-01");
+  assert.equal(q.get("counteragent_inn"), "7805733652");
+  assert.equal(q.get("direction"), null, "у Saby только входящие — direction не передаём");
+  assert.match(textOf(r), /Входящие Saby org 3 «Нотисенд, ООО»/);
+  assert.match(textOf(r), /нет в 1С: 1, уже в 1С: 1/);
+  assert.match(textOf(r), /УПД № 1639 от 2026-09-30 на 5.718.774.00, БК, ООО ИНН 7805733652 — уже есть в 1С: .*0000-000047.*входящий № 1639/);
+  assert.match(textOf(r), /\(вложения ещё нет\)/);
+
+  await callTool("list_saby_documents", { org_id: 3, not_in_onec: true, onec_check: false });
+  assert.equal(query(calls[1]).get("not_in_onec"), "1");
+  assert.equal(query(calls[1]).get("onec_check"), "1", "not_in_onec включает проверку сам");
+  await callTool("list_saby_documents", { org_id: 3, onec_check: false });
+  assert.equal(query(calls[2]).get("onec_check"), null);
+
+  calls = [];
+  const bad = await callTool("list_saby_documents", { org_id: 3, from: "2026-09-01", to: "2026-08-01" });
+  assert.equal(bad.isError, true);
+  assert.equal(calls.length, 0);
+});
+
+test("get_saby_document: путь с вложением и без, строки и подсказка про source=saby", async () => {
+  const doc = { ...sabyItem("found", "1639"), grounds: "Договор № 10769/09/26 от 01.09.2026", title: "Счет-фактура и УПД № 1639",
+    seller: { inn: "7805733652", kpp: "780701001", name: "ООО «БИЗНЕС-КОММУНИКАЦИИ»" }, totals: { net: 4689443, vat: 1029331, total: 5718774 },
+    lines: [{ line: 1, name: "Услуги по передаче электронных сообщений", amount: 5708108.28, vat_rate: "22%", vat_amount: 1029331 },
+            { line: 2, name: "Неисключительная лицензия на ПО", amount: 10665.72, vat_rate: "без НДС", vat_amount: 0 }], parse_note: null, onec_kind: "purchase" };
+  route("GET", `/edo/documents/${SDOC.toLowerCase()}/${SATT.toLowerCase()}`, okEnv(doc));
+  route("GET", `/edo/documents/${SDOC.toLowerCase()}`, okEnv(doc));
+  const r = await callTool("get_saby_document", { org_id: 3, document_id: SDOC, attachment_id: SATT });
+  assert.equal(r.isError, undefined, textOf(r));
+  assert.equal(query(calls[0]).get("provider"), "saby");
+  assert.equal(query(calls[0]).get("onec_check"), null);
+  assert.match(textOf(r), /основание: Договор № 10769\/09\/26 от 01\.09\.2026/);
+  assert.match(textOf(r), /Строк: 2; итого 5.718.774.00, НДС 1.029.331.00/);
+  assert.match(textOf(r), /1\. Услуги по передаче электронных сообщений — 5.708.108.28 \(22%, НДС 1.029.331.00\)/);
+  assert.match(textOf(r), /2\. Неисключительная лицензия на ПО — 10.665.72 \(без НДС\)/);
+  assert.match(textOf(r), /уже есть в 1С/);
+  assert.match(textOf(r), new RegExp(`source=saby, document_id=${SDOC.toLowerCase()}, attachment_id=${SATT.toLowerCase()}`));
+  await callTool("get_saby_document", { org_id: 3, document_id: SDOC, onec_check: false });
+  assert.equal(calls[1].path.split("?")[0], `/edo/documents/${SDOC.toLowerCase()}`);
+  assert.equal(query(calls[1]).get("onec_check"), "0");
+});
+
+test("get_edo_status: раздел Saby", async () => {
+  route("GET", "/edo/status", okEnv({ provider: "diadoc", configured: true, sync_enabled: false, boxes: [],
+    providers: { saby: { provider: "saby", installed: true, configured: true, last_error: null,
+      organizations: [{ org_id: 3, organization: "ООО \"НотиСенд\"", edo_ok: true, incoming_docs: 1 }, { org_id: 2, organization: "Интер", edo_ok: false, note: "нет ЭДО" }] } } }));
+  const s = await callTool("get_edo_status", {});
+  assert.match(textOf(s), /Saby: подключён/);
+  assert.match(textOf(s), /org 3 «ООО "НотиСенд"»: документооборот есть, входящих прочитано 1/);
+  assert.match(textOf(s), /org 2 «Интер»: нет документооборота — нет ЭДО/);
+});
+
 test("list_onec_documents: вид supplier_invoice", async () => {
   route("GET", "/onec/1/documents", okEnv({ items: [], total: 0, period: {} }));
   const r = await callTool("list_onec_documents", { org_id: 1, from: "2026-10-01", kind: ["purchase", "supplier_invoice"] });
@@ -266,6 +337,42 @@ test("документ поставщика вручную: проверки д�
   assert.match(textOf(w), /onec_duplicate/);
   assert.match(textOf(w), /Уже в 1С:/);
   assert.match(textOf(w), /"number":"88"/);
+});
+
+test("документ поставщика из Saby: source выводится из document_id, тело, превью, токен", async () => {
+  const sabyPreview = { ...docPreview, org_id: 3, organization: "НотиСенд",
+    source: { type: "saby", document_id: SDOC.toLowerCase(), attachment_id: SATT.toLowerCase(), saby_type: "УпдСчфДоп", title: "УПД № 1639",
+      status_text: "Выполнение завершено успешно", grounds: "Договор № 10769/09/26 от 01.09.2026" },
+    external_id: `saby:${SDOC.toLowerCase()}:${SATT.toLowerCase()}`, contract: { id: NOM, name: "10769/09/26 от 01.09.2026" },
+    checks: ["Договор — из основания документа (№ 10769/09/26 от 01.09.2026): «10769/09/26 от 01.09.2026»"] };
+  route("POST", "/onec/3/supplier-documents", (c) => c.body?.dry_run ? okEnv(sabyPreview)
+    : okEnv({ ...sabyPreview, dry_run: false, result: "created", payload: undefined, document: { id: UID, kind_name: "Поступление", number: "0000-000050" } }));
+  const args = { org_id: 3, document_id: SDOC, attachment_id: SATT, nomenclature_id: NOM };
+  const p = await callTool("create_onec_supplier_document", args);
+  assert.equal(p.isError, undefined, textOf(p));
+  const b0 = calls[0].body;
+  assert.equal(b0.source, "saby", "источник выводится из document_id");
+  assert.equal(b0.document_id, SDOC.toLowerCase());
+  assert.equal(b0.attachment_id, SATT.toLowerCase());
+  assert.equal("message_id" in b0, false);
+  assert.match(textOf(p), /Источник: Saby — «УПД № 1639» \(УпдСчфДоп\), Выполнение завершено успешно; основание: Договор № 10769\/09\/26/);
+  assert.match(textOf(p), /Договор: «10769\/09\/26 от 01\.09\.2026»/);
+  assert.match(textOf(p), /из основания документа/);
+  const r = await callTool("create_onec_supplier_document", { ...args, source: "saby", document_id: SDOC.toLowerCase(), confirm: tokenFrom(p) });
+  assert.equal(r.isError, undefined, textOf(r));
+  const { dry_run: _d, ...rest } = b0;
+  assert.deepEqual(last().body, rest);
+
+  calls = [];
+  let bad = await callTool("create_onec_supplier_document", { org_id: 3, source: "saby", attachment_id: SATT });
+  assert.match(textOf(bad), /нужен document_id/);
+  bad = await callTool("create_onec_supplier_document", { org_id: 3, document_id: SDOC, number: "1639" });
+  assert.match(textOf(bad), /из документа Saby — не передавайте seller, number, date/);
+  bad = await callTool("create_onec_supplier_document", { org_id: 3, message_id: MSG, entity_id: ENT, document_id: SDOC });
+  assert.match(textOf(bad), /document_id и attachment_id — только для source=saby/);
+  bad = await callTool("create_onec_supplier_document", { org_id: 3, source: "saby", document_id: SDOC, message_id: MSG });
+  assert.match(textOf(bad), /message_id и entity_id — только для source=diadoc/);
+  assert.equal(calls.length, 0);
 });
 
 test("документ поставщика вручную: НДС сверху — vat_included=false в теле, итог в превью, токен привязан к флагу", async () => {

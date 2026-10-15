@@ -10,8 +10,8 @@
 // или нельзя (дубли, документ бухгалтера, режим выключен) — токена нет.
 //
 // Документы поставщиков (задача пользователя 13.10.2026, balance class/onec_api_supplier.php, право onec.write):
-// поступление или счёт от поставщика из входящего документа Диадока или из данных пользователя, поставщик по ИНН
-// с договором, номенклатура и правка такого документа (PUT). Чтение Диадока — edo.ts.
+// поступление или счёт от поставщика из входящего документа Диадока, Saby (16.10.2026) или из данных пользователя,
+// поставщик по ИНН с договором, номенклатура и правка такого документа (PUT). Чтение Диадока и Saby — edo.ts.
 //
 // Счёт-фактура налогового агента (задача 15.10.2026, balance POST /onec/{org}/tax-agent-invoices): на оплату иностранному
 // поставщику, как «Создать на основании» у бухгалтера; превью — пробная запись 1С с откатом по каждой оплате.
@@ -129,7 +129,9 @@ function supplierDocText(d: any): string {
   return `${d.kind_name || d.kind || "Документ поставщика"} в 1С org ${d.org_id}${d.organization ? ` «${d.organization}»` : ""}:\n` + lines([
     src.type === "diadoc"
       ? `Источник: Диадок — «${src.title || "—"}» (${src.diadoc_type || "—"})${src.status_text ? `, ${src.status_text}` : ""}${src.grounds ? `; основание: ${src.grounds}` : ""}`
-      : `Источник: данные пользователя (продавец ИНН ${src.seller?.inn || "—"}${src.seller?.name ? ` «${src.seller.name}»` : ""})`,
+      : src.type === "saby"
+        ? `Источник: Saby — «${src.title || "—"}» (${src.saby_type || "—"})${src.status_text ? `, ${src.status_text}` : ""}${src.grounds ? `; основание: ${src.grounds}` : ""}`
+        : `Источник: данные пользователя (продавец ИНН ${src.seller?.inn || "—"}${src.seller?.name ? ` «${src.seller.name}»` : ""})`,
     has(d.incoming_number) ? `Входящий № ${d.incoming_number || "—"} от ${d.incoming_date || "—"}; дата документа в 1С ${d.date || "—"}` : "",
     cp.id
       ? `Поставщик в 1С: «${cp.name}» ИНН ${cp.inn || "—"}${cp.kpp ? ` КПП ${cp.kpp}` : ""} (id ${cp.id}, ${by[cp.by] || cp.by})`
@@ -552,9 +554,11 @@ export function registerOneCWriteTools(server: McpServer) {
       "(supplier_invoice). Источники: source=diadoc — входящий документ Диадока (message_id и entity_id из " +
       "list_diadoc_documents; продавец, номер, дата и строки УПД берутся из XML; вид по умолчанию: счёт Диадока — счёт от " +
       "поставщика, остальное — поступление; у счёта-файла и прочих видов строк нет — передайте lines, они же заменяют строки " +
-      "УПД); source=manual — данные, которые дал пользователь (seller, number, date, lines, kind обязателен; ключ дублей — как " +
+      "УПД); source=saby — входящий документ Saby (СБИС): document_id и attachment_id из list_saby_documents, строки — из XML " +
+      "УПД, как у Диадока; source=manual — данные, которые дал пользователь (seller, number, date, lines, kind обязателен; ключ дублей — как " +
       "у «Первички», так что тот же документ, заведённый по фото, не задвоится). Поставщик ищется в 1С по ИНН продавца (КПП " +
-      "уточняет); нет — сначала create_onec_supplier, несколько — передайте onec_counterparty_id. У поступления КАЖДОЙ строке " +
+      "уточняет); нет — сначала create_onec_supplier, несколько — передайте onec_counterparty_id. Договор не передан, а в " +
+      "основании УПД (Диадок, Saby) есть договор, который у поставщика в 1С один, — берётся он. У поступления КАЖДОЙ строке " +
       "нужна номенклатура 1С (nomenclature_id — общая, line_nomenclature или lines[].nomenclature_id — по строкам; найти — " +
       "search_onec_nomenclature, завести — create_onec_nomenclature); у счёта от поставщика — не обязательна, строка пишется " +
       "текстом. Дубли: тот же документ (тот же ключ) вернёт уже созданный; документ с тем же входящим номером у того же " +
@@ -566,10 +570,14 @@ export function registerOneCWriteTools(server: McpServer) {
       "и ТЕМИ ЖЕ полями — запись. Поправить потом — update_onec_document.",
     inputSchema: {
       org_id: orgId(),
-      source: z.enum(["diadoc", "manual"]).optional()
-        .describe("diadoc — входящий документ Диадока, manual — данные пользователя (по умолчанию diadoc, если передан message_id)"),
+      source: z.enum(["diadoc", "saby", "manual"]).optional()
+        .describe("diadoc — входящий документ Диадока, saby — входящий документ Saby (СБИС), manual — данные пользователя " +
+          "(по умолчанию diadoc, если передан message_id; saby, если передан document_id)"),
       message_id: z.string().regex(UUID_RE, "GUID документа Диадока").optional().describe("source=diadoc: message_id документа Диадока (list_diadoc_documents)"),
       entity_id: z.string().regex(UUID_RE, "GUID документа Диадока").optional().describe("source=diadoc: entity_id документа Диадока"),
+      document_id: z.string().regex(UUID_RE, "GUID документа Saby").optional().describe("source=saby: document_id документа Saby (list_saby_documents)"),
+      attachment_id: z.string().regex(UUID_RE, "GUID вложения Saby").optional()
+        .describe("source=saby: attachment_id вложения (УПД) из list_saby_documents; без него — основное вложение"),
       kind: z.enum(["purchase", "supplier_invoice"]).optional()
         .describe("purchase — поступление (акт, накладная, УПД), supplier_invoice — счёт от поставщика; для manual обязателен"),
       seller: z.object({
@@ -599,14 +607,17 @@ export function registerOneCWriteTools(server: McpServer) {
     },
     annotations: WRITE,
   }, async (a, extra) => {
-    const source = a.source ?? (a.message_id || a.entity_id ? "diadoc" : "manual");
-    if (source === "diadoc") {
-      if (!a.message_id || !a.entity_id) return fail("Для source=diadoc нужны message_id и entity_id документа (list_diadoc_documents).");
+    const source = a.source ?? (a.message_id || a.entity_id ? "diadoc" : a.document_id || a.attachment_id ? "saby" : "manual");
+    if (source !== "diadoc" && (a.message_id || a.entity_id)) return fail("message_id и entity_id — только для source=diadoc.");
+    if (source !== "saby" && (a.document_id || a.attachment_id)) return fail("document_id и attachment_id — только для source=saby.");
+    if (source === "diadoc" || source === "saby") {
+      if (source === "diadoc" && (!a.message_id || !a.entity_id)) return fail("Для source=diadoc нужны message_id и entity_id документа (list_diadoc_documents).");
+      if (source === "saby" && !a.document_id) return fail("Для source=saby нужен document_id документа Saby (и attachment_id вложения — list_saby_documents).");
       if (a.seller || a.number || a.date) {
-        return fail("Для source=diadoc продавец, номер и дата берутся из документа Диадока — не передавайте seller, number, date (дата документа в 1С — document_date).");
+        return fail(`Для source=${source} продавец, номер и дата берутся из документа ${source === "saby" ? "Saby" : "Диадока"} — не передавайте ` +
+          "seller, number, date (дата документа в 1С — document_date).");
       }
     } else {
-      if (a.message_id || a.entity_id) return fail("message_id и entity_id — только для source=diadoc.");
       if (!a.kind) return fail("Для ручного ввода нужен kind: purchase (поступление) или supplier_invoice (счёт от поставщика).");
       if (!a.number || !a.date) return fail("Для ручного ввода нужны number и date документа поставщика.");
       if (!a.lines?.length) return fail("Для ручного ввода нужны строки lines.");
@@ -621,6 +632,7 @@ export function registerOneCWriteTools(server: McpServer) {
     const fields = {
       org_id: a.org_id, source,
       message_id: lc(a.message_id), entity_id: lc(a.entity_id),
+      document_id: lc(a.document_id), attachment_id: lc(a.attachment_id),
       kind: a.kind ?? null,
       seller: source === "manual" ? { inn: a.seller?.inn ?? null, kpp: a.seller?.kpp ?? null, name: a.seller?.name?.trim() || null } : null,
       number: a.number?.trim() || null, date: a.date ?? null,
