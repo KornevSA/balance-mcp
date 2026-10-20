@@ -55,6 +55,25 @@ function onecText(o: any, inn?: string): string {
   }
 }
 
+/** Пункты ответа invite/accept: с org_id balance отдаёт один, без — {items[]} по организациям. */
+function edoItems(d: any): any[] {
+  if (Array.isArray(d?.items)) return d.items;
+  return d && d.result ? [d] : [];
+}
+
+/** «Клиент «ООО Ромашка» (ИНН 7700000000)» — из первого пункта, где клиент назван. */
+function edoHead(d: any, items: any[]): string {
+  const p = items.find((i) => i.customer_name) || {};
+  return `Клиент «${p.customer_name || `#${d?.customer_id ?? p.customer_id ?? "?"}`}»${p.inn ? ` (ИНН ${p.inn})` : ""}, ЭДО в Диадоке:`;
+}
+
+/** «- «ООО Интер» (ИНН 7017351722): клиент в Диадоке есть… → будет отправлено» + предупреждения. */
+function edoItemLine(p: any, what: string): string {
+  const org = `«${p.organization || `org ${p.org_id}`}»${p.organization_inn ? ` (ИНН ${p.organization_inn})` : ""}`;
+  const warn = (p.warnings || []).length ? `\n  ⚠ ${(p.warnings as string[]).join("\n  ⚠ ")}` : "";
+  return `- ${org}: ${p.status_name ? `${p.status_name} → ` : ""}${what}${warn}`;
+}
+
 export function registerEdoTools(server: McpServer) {
   server.registerTool("get_edo_status", {
     title: "ЭДО (Диадок): подключение и ящики",
@@ -170,10 +189,11 @@ export function registerEdoTools(server: McpServer) {
       "Клиент balance как контрагент в Диадоке — по каждой нашей организации с ящиком: статус приглашения к " +
       "электронному документообороту и даты. Статусы: accepted — приглашение принято (обмен налажен, accepted_at — с " +
       "какого числа), invited — приглашение отправлено, ответа нет (invited_at; invited_from_balance — отправлено из " +
-      "balance), invites_me — клиент сам приглашает нас (принять в Диадоке), rejected / rejected_by_me — отказ, " +
+      "balance), invites_me — клиент сам приглашает нас (принять — accept_customer_edo_invitation), rejected / rejected_by_me — отказ, " +
       "not_invited — клиент в Диадоке есть, приглашение не отправлялось, roaming — клиент у другого оператора ЭДО, " +
       "not_in_diadoc — клиента в Диадоке нет, unknown — ещё не проверялось. refresh=true — сначала обновить из Диадока " +
-      "(иначе — данные фоновой проверки, checked_at). Пригласить — invite_customer_to_edo.",
+      "(иначе — данные фоновой проверки, checked_at). «нужен ЭДО» — с этой организацией клиенту нужен документооборот по " +
+      "правилу balance (от неё идут закрывающие или документы нового клиента). Пригласить — invite_customer_to_edo.",
     inputSchema: {
       customer_id: z.number().int().positive().describe("id клиента в balance"),
       refresh: z.boolean().optional().describe("Обновить статус из Диадока сейчас (по умолчанию — сохранённый)"),
@@ -185,10 +205,11 @@ export function registerEdoTools(server: McpServer) {
     if (!env.ok) return onecFail(env);
     const items: any[] = env.data?.items || [];
     const line = (s: any) => {
-      const when = s.status === "accepted" && s.accepted_at ? `, с ${String(s.accepted_at).slice(0, 10)}`
+      const when = s.status === "accepted" && s.accepted_at ? `, с ${String(s.accepted_at).slice(0, 10)}${s.accepted_from_balance ? " (принято из balance)" : ""}`
         : s.status === "invited" && s.invited_at ? `, отправлено ${String(s.invited_at).slice(0, 10)}${s.invited_from_balance ? " из balance" : ""}`
         : (s.status === "rejected" || s.status === "rejected_by_me") && s.rejected_at ? `, ${String(s.rejected_at).slice(0, 10)}` : "";
-      return `org ${s.org_id} «${s.organization}»: ${s.status_name}${when}${s.error ? ` (ошибка: ${s.error})` : ""}`;
+      return `org ${s.org_id} «${s.organization}»: ${s.status_name}${when}${s.is_target ? ` — нужен ЭДО: ${s.target_why}` : ""}` +
+        `${s.error ? ` (ошибка: ${s.error})` : ""}`;
     };
     return ok(`Клиент #${a.customer_id} в Диадоке:\n${items.map(line).join("\n") || "ящиков Диадока с доступом к API нет"}`, env.data);
   });
@@ -220,47 +241,98 @@ export function registerEdoTools(server: McpServer) {
     title: "ЭДО: пригласить клиента в Диадок",
     description:
       "Отправить клиенту приглашение к электронному документообороту в Диадоке от нашей организации (по ИНН клиента). " +
+      "Без org_id организации выбирает balance: от кого клиент получал закрывающие за 12 месяцев, а новому клиенту — " +
+      "эмитент его документов (договор → последний счёт → организация группы); с org_id — от этой организации. " +
       "Это ИСХОДЯЩЕЕ действие от имени организации — только по явной просьбе пользователя. ДВА ШАГА: без confirm — " +
       "превью (свежий статус из Диадока, кому, от кого, текст, предупреждения: клиент у другого оператора — дойдёт только " +
-      "при роуминге; клиента нет в Диадоке — Диадок заведёт ему ящик по ЕГРЮЛ) и токен; с confirm и ТЕМИ ЖЕ полями — " +
-      "отправка. Уже партнёр или сам приглашает нас — отправлять нечего; уже приглашён — повтор только с resend=true. " +
-      "Текст по умолчанию — из настроек balance. Право edo.invite.",
+      "при роуминге; клиента нет в Диадоке — Диадок заведёт ему ящик по ЕГРЮЛ; способ доставки в карточке не «Диадок (авт.)») " +
+      "и токен; с confirm и ТЕМИ ЖЕ полями — отправка. Уже партнёр — отправлять нечего; сам приглашает нас — " +
+      "accept_customer_edo_invitation; уже приглашён — повтор только с resend=true. Текст по умолчанию — из настроек " +
+      "balance. Право edo.invite.",
     inputSchema: {
       customer_id: z.number().int().positive().describe("id клиента в balance"),
-      org_id: orgId(),
+      org_id: orgId().optional().describe("Организация-отправитель (org_id из get_edo_status); без неё — по правилу balance"),
       message: z.string().max(2000).optional().describe("Текст приглашения (по умолчанию — из настроек)"),
       resend: z.boolean().optional().describe("Отправить ещё раз, если уже приглашали"),
       confirm: z.string().optional().describe("Токен подтверждения из превью-вызова. БЕЗ него ничего не отправляется"),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   }, async (a, extra) => {
-    const fields = { customer_id: a.customer_id, org_id: a.org_id, message: (a.message ?? "").trim(), resend: !!a.resend };
+    const fields = { customer_id: a.customer_id, org_id: a.org_id ?? 0, message: (a.message ?? "").trim(), resend: !!a.resend };
     const path = `/customers/${a.customer_id}/edo/invite`;
-    const body: any = { org_id: a.org_id, resend: fields.resend };
+    const body: any = { resend: fields.resend };
+    if (a.org_id) body.org_id = a.org_id;
     if (fields.message !== "") body.message = fields.message;
     const run = (dry: boolean) => balanceCall(tokenOf(extra), "POST", path, dry ? { ...body, dry_run: true } : body,
       { timeoutMs: EDO_TIMEOUT_MS, write: !dry });
-    const head = (p: any) => `Приглашение к ЭДО в Диадоке от «${p.organization}» клиенту «${p.customer_name}» (ИНН ${p.inn}). ` +
-      `Сейчас: ${p.status_name}.`;
     if (!a.confirm) {
       const env = await run(true);
       if (!env.ok) return onecFail(env);
-      const p = env.data || {};
-      if (p.will !== "invite") {
-        return ok(`${head(p)}\n${p.note || "Отправлять нечего."}\nПодтверждать нечего — ничего не отправлено.`, { requires_confirmation: false, preview: p });
+      const its = edoItems(env.data);
+      const will = its.filter((p) => p.will === "invite");
+      const lines = its.map((p) => edoItemLine(p, p.will === "invite" ? "будет отправлено приглашение" : p.note || "отправлять нечего"));
+      if (!will.length) {
+        return ok(`${edoHead(env.data, its)}\n${lines.join("\n") || "Приглашать не от кого."}\nПодтверждать нечего — ничего не отправлено.`,
+          { requires_confirmation: false, preview: env.data });
       }
       const ct = confirmToken("edo_invite", a.customer_id, fields);
-      const warn = (p.warnings || []).length ? `\n⚠ ${(p.warnings as string[]).join("\n⚠ ")}` : "";
-      return ok(`${head(p)}\nТекст: «${p.message}»${warn}\n\nНичего не отправлено. Чтобы отправить — повторите вызов с ТЕМИ ЖЕ полями и confirm="${ct}" (токен живёт 15 минут).`,
-        { requires_confirmation: true, confirm_token: ct, preview: p });
+      return ok(`${edoHead(env.data, its)}\n${lines.join("\n")}\nТекст: «${will[0].message}»\n\nНичего не отправлено. Чтобы отправить — ` +
+        `повторите вызов с ТЕМИ ЖЕ полями и confirm="${ct}" (токен живёт 15 минут).`,
+        { requires_confirmation: true, confirm_token: ct, preview: env.data });
     }
     const v = verifyConfirmToken(a.confirm, "edo_invite", a.customer_id, fields);
     if (!v.ok) return fail(`Токен подтверждения ${v.reason ?? "неверен"}. Вызовите invite_customer_to_edo без confirm — получите свежее превью и токен.`);
     const env = await run(false);
     if (!env.ok) return onecFail(env);
-    const r = env.data || {};
-    if (r.result !== "invited") return ok(`${head(r)}\n${r.note || "Ничего не отправлено."}`, r);
-    return ok(`Приглашение отправлено от «${r.organization}» клиенту «${r.customer_name}» (ИНН ${r.inn})` +
-      (r.pending ? ". Диадок ещё обрабатывает — статус обновится сам (get_customer_edo_status refresh=true)." : "."), r);
+    const its = edoItems(env.data);
+    const lines = its.map((p) => edoItemLine(p, p.result === "invited"
+      ? "приглашение отправлено" + (p.pending ? " (Диадок ещё обрабатывает — статус обновится сам, get_customer_edo_status refresh=true)" : "")
+      : p.note || "ничего не отправлено"));
+    return ok(`${edoHead(env.data, its)}\n${lines.join("\n") || "Приглашать не от кого."}`, env.data);
+  });
+
+  server.registerTool("accept_customer_edo_invitation", {
+    title: "ЭДО: принять приглашение клиента в Диадоке",
+    description:
+      "Принять приглашение к электронному документообороту, которое клиент сам прислал нашей организации в Диадоке " +
+      "(статус invites_me). Действие от имени организации — только по явной просьбе пользователя. ДВА ШАГА: без confirm — " +
+      "превью (кто приглашает, его текст, предупреждения; к приглашению приложен документ на подпись — принять нельзя, " +
+      "его подписывают в Диадоке) и токен; с confirm и ТЕМИ ЖЕ полями — приём. Без org_id — во всех наших ящиках, где " +
+      "клиент приглашает. Способ доставки документов в карточке не меняется. Право edo.invite.",
+    inputSchema: {
+      customer_id: z.number().int().positive().describe("id клиента в balance"),
+      org_id: orgId().optional().describe("Организация, в чей ящик пришло приглашение; без неё — во всех, где оно есть"),
+      confirm: z.string().optional().describe("Токен подтверждения из превью-вызова. БЕЗ него ничего не принимается"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  }, async (a, extra) => {
+    const fields = { customer_id: a.customer_id, org_id: a.org_id ?? 0 };
+    const path = `/customers/${a.customer_id}/edo/accept`;
+    const body: any = a.org_id ? { org_id: a.org_id } : {};
+    const run = (dry: boolean) => balanceCall(tokenOf(extra), "POST", path, dry ? { ...body, dry_run: true } : body,
+      { timeoutMs: EDO_TIMEOUT_MS, write: !dry });
+    if (!a.confirm) {
+      const env = await run(true);
+      if (!env.ok) return onecFail(env);
+      const its = edoItems(env.data);
+      const will = its.filter((p) => p.will === "accept");
+      const lines = its.map((p) => edoItemLine(p, p.will === "accept"
+        ? "будет принято" + (p.message_from_customer ? `; клиент пишет: «${p.message_from_customer}»` : "")
+        : p.note || "принимать нечего"));
+      if (!will.length) {
+        return ok(`${edoHead(env.data, its)}\n${lines.join("\n") || env.data?.note || "Входящих приглашений от клиента нет."}\n` +
+          "Подтверждать нечего — ничего не принято.", { requires_confirmation: false, preview: env.data });
+      }
+      const ct = confirmToken("edo_accept", a.customer_id, fields);
+      return ok(`${edoHead(env.data, its)}\n${lines.join("\n")}\n\nНичего не принято. Чтобы принять — повторите вызов с ТЕМИ ЖЕ полями ` +
+        `и confirm="${ct}" (токен живёт 15 минут).`, { requires_confirmation: true, confirm_token: ct, preview: env.data });
+    }
+    const v = verifyConfirmToken(a.confirm, "edo_accept", a.customer_id, fields);
+    if (!v.ok) return fail(`Токен подтверждения ${v.reason ?? "неверен"}. Вызовите accept_customer_edo_invitation без confirm — получите свежее превью и токен.`);
+    const env = await run(false);
+    if (!env.ok) return onecFail(env);
+    const its = edoItems(env.data);
+    const lines = its.map((p) => edoItemLine(p, p.result === "accepted" ? "приглашение клиента принято" : p.note || "ничего не принято"));
+    return ok(`${edoHead(env.data, its)}\n${lines.join("\n") || env.data?.note || "Входящих приглашений от клиента нет."}`, env.data);
   });
 }
