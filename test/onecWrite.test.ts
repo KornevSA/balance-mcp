@@ -207,6 +207,41 @@ test("отправка: оплата — превью с проводками, �
   assert.match(textOf(r), /реализация #2005: Создана/);
 });
 
+test("отправка: акт без аванса на договоре — подсказка, обход по контрагенту привязан к токену", async () => {
+  const bodies: any[] = [];
+  route("POST", "/documents/2006/onec/send", (c) => {
+    bodies.push(c.body);
+    const byCp = c.body?.advance_scope === "counterparty";
+    if (c.body?.dry_run && !byCp) {
+      return okEnv({ dry_run: true, org_id: 1, route: "sale", route_name: "выгрузка реализаций", ok: false, state: "checked",
+        message: "В 1С по договору «Д» аванса 0,00 ₽ — меньше акта (8 570,00 ₽): … По контрагенту в целом аванс 36 700,00 ₽ покрывает акт" });
+    }
+    return okEnv({ dry_run: !!c.body?.dry_run, org_id: 1, route: "sale", route_name: "выгрузка реализаций", ok: true,
+      state: c.body?.dry_run ? "checked" : "ok", message: c.body?.dry_run ? "Готов к выгрузке. … по контрагенту в целом" : "Создана реализация 566816" });
+  });
+  const blocked = await callTool("send_document_to_onec", { doc_id: 2006 });
+  assert.equal(blocked.isError, true);
+  assert.match(textOf(blocked), /по контрагенту в целом аванс 36 700/i);
+  assert.equal(bodies[0].advance_scope, undefined);
+
+  const p = await callTool("send_document_to_onec", { doc_id: 2006, advance_scope: "counterparty" });
+  assert.equal(bodies[1].advance_scope, "counterparty");
+  assert.equal(bodies[1].dry_run, true);
+  const token = tokenFrom(p);
+  assert.ok(token);
+
+  // Токен превью с обходом не подходит к отправке без обхода — и наоборот
+  const wrong = await callTool("send_document_to_onec", { doc_id: 2006, confirm: token });
+  assert.equal(wrong.isError, true);
+  assert.equal(bodies.length, 2);
+
+  const r = await callTool("send_document_to_onec", { doc_id: 2006, advance_scope: "counterparty", confirm: token });
+  assert.equal(r.isError, undefined);
+  assert.equal(bodies[2].advance_scope, "counterparty");
+  assert.equal(bodies[2].dry_run, undefined);
+  assert.match(textOf(r), /Создана реализация 566816/);
+});
+
 test("отправка: уже в 1С — подтверждать нечего", async () => {
   route("POST", "/documents/2001/onec/send", okEnv({ org_id: 1, route: "old", route_name: "прежний сервис", ok: true, state: "ok", result: "exists", message: "Уже в 1С" }));
   const r = await callTool("send_document_to_onec", { doc_id: 2001 });

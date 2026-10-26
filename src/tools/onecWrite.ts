@@ -418,17 +418,24 @@ export function registerOneCWriteTools(server: McpServer) {
       "реализаций, счёт или акт клиенту — прежним сервисом 1С («Создать в 1С»). ДВУХШАГОВО: без confirm — каким путём пойдёт " +
       "и что мешает (режим организации выключен, нет ИНН или договора, оплата раньше 01.07.2026), у оплат — проводки пробного " +
       "проведения; с confirm — отправка. Подчиняется режимам выгрузки организаций. Использовать только по явной просьбе: " +
-      "обычно документы уходят в 1С сами.",
+      "обычно документы уходят в 1С сами. Акт к банковской оплате уходит, только если в 1С на договоре оплаты есть аванс на " +
+      "его сумму; когда аванс покупателя лежит на другом его договоре (превью так и скажет) — advance_scope=counterparty, " +
+      "только по явной просьбе пользователя.",
     inputSchema: {
       doc_id: z.number().int().positive().describe("id документа в balance"),
+      advance_scope: z.enum(["contract", "counterparty"]).optional().describe(
+        "Только акт к банковской оплате: чей аванс в 1С должен покрыть акт. contract (по умолчанию) — по договору оплаты; " +
+        "counterparty — по контрагенту в целом (62 всех его договоров), когда авансы и долги покупателя в 1С разнесены по " +
+        "разным договорам и не зачтены. Дубль (оплату уже закрыла реализация бухгалтера) не пропускает и так"),
       confirm: confirm(),
     },
     annotations: WRITE,
   }, async (a, extra) => {
-    const fields = { doc_id: a.doc_id };
+    const scope = a.advance_scope === "counterparty" ? { advance_scope: "counterparty" } : {};
+    const fields = { doc_id: a.doc_id, ...scope };
     const path = `/documents/${a.doc_id}/onec/send`;
     if (!a.confirm) {
-      const env = await call(extra, "POST", path, { dry_run: true }, LONG_TIMEOUT_MS);
+      const env = await call(extra, "POST", path, { dry_run: true, ...scope }, LONG_TIMEOUT_MS);
       if (!env.ok) return onecFail(env);
       const d = env.data || {};
       const head = `Документ balance #${a.doc_id} → 1С org ${d.org_id}: ${d.route_name}.`;
@@ -439,7 +446,7 @@ export function registerOneCWriteTools(server: McpServer) {
     }
     const v = verifyConfirmToken(a.confirm, "onec_send", a.doc_id, fields);
     if (!v.ok) return badToken("send_document_to_onec", v.reason);
-    const env = await call(extra, "POST", path, {}, LONG_TIMEOUT_MS);
+    const env = await call(extra, "POST", path, { ...scope }, LONG_TIMEOUT_MS);
     if (!env.ok) return onecFail(env);
     const d = env.data || {};
     const sales = ((d.sales_export || []) as any[]).map((s) => `реализация #${s.doc_id}: ${s.ok ? "" : "НЕ ВЫГРУЖЕНА — "}${s.message}`);
