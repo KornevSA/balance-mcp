@@ -1,6 +1,8 @@
 // Тулзы ЭДО (Диадок, Saby) — ЧТЕНИЕ (задача пользователя 13.10.2026, Saby — 16.10.2026) и ЧЕРНОВИКИ (11.11.2026):
 // create_edo_draft / delete_edo_draft / list_edo_drafts — документ balance или 1С черновиком в СБИС (по умолчанию) или
 // Диадок; отправляет оператор, balance не подписывает (balance /api/v1/edo/drafts, onec:write + право edo.draft).
+// С 13.11.2026 — и файлы balance: договор, доп. соглашение, письмо, произвольный документ (kind + file_id / contract_id,
+// миграция balance 184).
 //
 // MCP в Диадок и Saby не ходит: тулзы зовут balance /api/v1/edo/…, а balance сам берёт ящик организации, ключи
 // и проверяет скоуп onec:read, право onec.view (пользователю с зоной дилера — 403: ящик организации —
@@ -68,6 +70,10 @@ function draftText(d: any): string {
       `${upd.basis ? `; основание: ${upd.basis}` : "; без основания"}` : "",
     d.file ? `Файл: ${d.file.name}${d.file.size ? ` (${Math.max(1, Math.round(d.file.size / 1024))} КБ)` : ""}${d.file.from ? `, ${d.file.from}` : ""}` : "",
     d.doc_id ? `Документ balance #${d.doc_id}` + (d.onec_id ? `, документ 1С ${d.onec_id}` : "") : d.onec_id ? `Документ 1С ${d.onec_id}` : "",
+    d.contract && (d.contract.number || d.contract.contract_id)
+      ? `${d.kind === "agreement" ? "Основной договор" : "Договор"}: № ${d.contract.number || "—"} от ${d.contract.date || "—"}` +
+        (d.contract.contract_id ? ` (договор balance #${d.contract.contract_id})` : "") : "",
+    d.kind === "document" ? `Подпись получателя: ${d.need_signature ? "запрошена" : "не нужна (только получение)"}` : "",
     ...((d.warnings || []) as string[]).map((w) => `⚠ ${w}`),
     d.where ? `Оператору: ${d.where}` : "",
   ];
@@ -290,30 +296,67 @@ export function registerEdoTools(server: McpServer) {
     description:
       "Положить документ ЧЕРНОВИКОМ в ЭДО нашей организации — по умолчанию в СБИС (Saby), provider=diadoc — в Диадок. " +
       "balance ничего не отправляет и не подписывает: черновик видит только наша организация, оператор открывает его, " +
-      "проверяет, подписывает и отправляет сам. Источник — документ balance (doc_id) или документ 1С (org_id + onec_id, " +
-      "например акт сверки из create_onec_reconciliation). Что кладётся: счёт — PDF; УПД (акт balance или реализация 1С) — " +
-      "формализованный УПД 5.03, номер, дата, строки, ставки и договор берутся из 1С: есть счёт-фактура выданный — СЧФДОП с " +
-      "её номером на печать, нет и строки без НДС — ДОП с номером реализации (документ balance должен быть в 1С — " +
-      "send_document_to_onec); акт сверки — PDF. Не кладёт (blockers в превью): клиент не наш контрагент в Диадоке или его нет " +
-      "в СБИС как участника ЭДО; такой документ уже лежит черновиком или уже ушёл клиенту (по данным balance и живому поиску " +
-      "у оператора по номеру и ИНН); у организации нет ящика или документооборота. ДВУХШАГОВО: без confirm — превью (что, " +
-      "кому, номер, строки УПД, файл, предупреждения: например, что 1С может отправить тот же УПД через Диадок), в ЭДО ничего " +
-      "не пишется; с confirm и ТЕМИ ЖЕ полями — черновик. Использовать только по явной просьбе пользователя.",
+      "проверяет, подписывает и отправляет сам (отправить без подписи КЭП ни СБИС, ни Диадок не дают). Источник — один из трёх: " +
+      "(1) документ balance (doc_id); (2) документ 1С (org_id + onec_id, например акт сверки из create_onec_reconciliation); " +
+      "(3) файл balance — договор, доп. соглашение, письмо или произвольный документ (kind + file_id и/или contract_id). " +
+      "Что кладётся: счёт — PDF; УПД (акт balance или реализация 1С) — формализованный УПД 5.03, номер, дата, строки, ставки и " +
+      "договор берутся из 1С: есть счёт-фактура выданный — СЧФДОП с её номером на печать, нет и строки без НДС — ДОП с номером " +
+      "реализации (документ balance должен быть в 1С — send_document_to_onec); акт сверки — PDF. Файлы — как есть (PDF, DOCX, " +
+      "XLSX, сканы): kind=contract — договор (Диадок «Договор», СБИС ДоговорДок; подписывают обе стороны): contract_id без " +
+      "file_id — единственный файл договора, номер и дата — из договора balance (get_contract), если файлов несколько — укажите " +
+      "file_id; kind=agreement — доп. соглашение: нужны number и date соглашения, основной договор — contract_id, договор файла " +
+      "или contract_number + contract_date; kind=letter — письмо (Диадоку нужен number — исходящий номер); kind=document — " +
+      "произвольный документ, need_signature=true просит подпись получателя (только Диадок; в СБИС получатель лишь " +
+      "подтверждает получение). Файл клиента без договора — с org_id (от какой организации). Файлы — list_customer_files; " +
+      "новый файл сначала загрузить upload_customer_file. Не кладёт (blockers в превью): клиент не наш контрагент в Диадоке или " +
+      "его нет в СБИС как участника ЭДО; такой документ (тот же файл) уже лежит черновиком или уже ушёл клиенту (по данным " +
+      "balance и живому поиску у оператора по номеру и ИНН); у организации нет ящика или документооборота. ДВУХШАГОВО: без " +
+      "confirm — превью (что, кому, номер, строки УПД, файл, предупреждения), в ЭДО ничего не пишется; с confirm и ТЕМИ ЖЕ " +
+      "полями — черновик. Использовать только по явной просьбе пользователя.",
     inputSchema: {
       provider: z.enum(["saby", "diadoc"]).optional().describe("Куда: saby — СБИС (по умолчанию), diadoc — Диадок"),
       doc_id: z.number().int().positive().optional().describe("Документ balance: счёт, УПД (акт) или акт сверки"),
-      org_id: z.number().int().positive().optional().describe("Вместе с onec_id: организация = база 1С (list_onec_bases)"),
+      org_id: z.number().int().positive().optional()
+        .describe("С onec_id — организация = база 1С (list_onec_bases); с file_id без договора — от какой организации класть"),
       onec_id: z.string().regex(UUID_RE, "UUID ссылки 1С").optional().describe("Документ 1С (счёт, реализация, акт сверки) — вместо doc_id"),
+      kind: z.enum(["contract", "agreement", "letter", "document"]).optional()
+        .describe("Для файла balance: contract — договор (по умолчанию при contract_id), agreement — доп. соглашение, letter — письмо, document — произвольный"),
+      file_id: z.number().int().positive().optional().describe("Файл balance — клиента или договора (list_customer_files)"),
+      contract_id: z.number().int().positive().optional().describe("Договор balance (list_contracts): договор или основной договор доп. соглашения"),
+      number: z.string().max(100).optional().describe("Номер документа (договор — по умолчанию из договора balance; письмо — исходящий номер)"),
+      date: z.string().regex(DATE_RE, "ГГГГ-ММ-ДД").optional().describe("Дата документа, ГГГГ-ММ-ДД (договор — из договора balance; письмо и документ — по умолчанию сегодня)"),
+      contract_number: z.string().max(100).optional().describe("Доп. соглашение: номер основного договора, если нет contract_id"),
+      contract_date: z.string().regex(DATE_RE, "ГГГГ-ММ-ДД").optional().describe("Доп. соглашение: дата основного договора, ГГГГ-ММ-ДД"),
+      total: z.number().nonnegative().optional().describe("Сумма: цена договора или доп. соглашения (необязательно)"),
+      need_signature: z.boolean().optional().describe("kind=document: запросить подпись получателя (Диадок)"),
       confirm: z.string().optional().describe("Токен подтверждения из превью-вызова. БЕЗ него ничего не записывается"),
     },
     annotations: DRAFT_WRITE,
   }, async (a, extra) => {
     const provider = a.provider ?? "saby";
-    if (a.doc_id && (a.onec_id || a.org_id)) return fail("Передайте что-то одно: doc_id (документ balance) или org_id + onec_id (документ 1С).");
-    if (!a.doc_id && !(a.org_id && a.onec_id)) return fail("Нужен doc_id (документ balance) или org_id + onec_id (документ 1С).");
-    const src = a.doc_id ? { doc_id: a.doc_id } : { org_id: a.org_id, onec_id: String(a.onec_id).toLowerCase() };
+    const isFile = Boolean(a.file_id || a.contract_id);
+    const fileOnly = [a.kind, a.number, a.date, a.contract_number, a.contract_date, a.total, a.need_signature].some((v) => v !== undefined);
+    if ([a.doc_id, a.onec_id, isFile || undefined].filter(Boolean).length > 1) {
+      return fail("Передайте что-то одно: doc_id (документ balance), org_id + onec_id (документ 1С) или файл balance (file_id / contract_id).");
+    }
+    if (!isFile && fileOnly) return fail("kind, number, date, contract_*, total, need_signature — только для файла balance (file_id / contract_id).");
+    if (a.doc_id && a.org_id) return fail("org_id не нужен с doc_id: организация — из документа balance.");
+    let src: Record<string, unknown>;
+    if (isFile) {
+      if (a.file_id && !a.contract_id && !a.kind) return fail("Для файла без договора укажите kind: contract, agreement, letter или document.");
+      src = Object.fromEntries(Object.entries({
+        kind: a.kind, file_id: a.file_id, contract_id: a.contract_id, org_id: a.org_id, number: a.number, date: a.date,
+        contract_number: a.contract_number, contract_date: a.contract_date, total: a.total, need_signature: a.need_signature,
+      }).filter(([, v]) => v !== undefined));
+    } else if (a.doc_id) {
+      src = { doc_id: a.doc_id };
+    } else if (a.org_id && a.onec_id) {
+      src = { org_id: a.org_id, onec_id: String(a.onec_id).toLowerCase() };
+    } else {
+      return fail("Нужен doc_id (документ balance), org_id + onec_id (документ 1С) или файл balance: kind + file_id и/или contract_id.");
+    }
     const fields = { provider, ...src };
-    const id = a.doc_id ?? a.org_id ?? 0;
+    const id = a.doc_id ?? a.file_id ?? a.contract_id ?? a.org_id ?? 0;
     const call = (dry: boolean) => balanceCall(tokenOf(extra), "POST", "/edo/drafts", { provider, ...src, dry_run: dry, source: "MCP" },
       { timeoutMs: DRAFT_TIMEOUT_MS, write: !dry });
     if (!a.confirm) {
@@ -360,9 +403,10 @@ export function registerEdoTools(server: McpServer) {
     const d = env.data || {};
     const items: any[] = d.items || [];
     const st: Record<string, string> = { draft: "лежит у оператора", sent: "отправлен оператором", deleted: "удалён" };
-    const rows = items.slice(0, 50).map((r) => `• #${r.id} ${PROVIDER_NAMES[r.provider] || r.provider}: ${r.kind_name} № ${r.number} от ${r.date}` +
+    const rows = items.slice(0, 50).map((r) => `• #${r.id} ${PROVIDER_NAMES[r.provider] || r.provider}: ${r.kind_name} № ${r.number || "—"} от ${r.date}` +
       ` — ${r.counteragent?.name || "—"}${r.counteragent?.inn ? ` ИНН ${r.counteragent.inn}` : ""}; ${st[r.state] || r.state}` +
-      `${r.doc_id ? `; документ #${r.doc_id}` : ""}${r.link && r.state === "draft" ? `; ${r.link}` : ""}`);
+      `${r.doc_id ? `; документ #${r.doc_id}` : ""}${r.file_id ? `; файл #${r.file_id}${r.file_name ? ` «${r.file_name}»` : ""}` : ""}` +
+      `${r.link && r.state === "draft" ? `; ${r.link}` : ""}`);
     return ok(`Черновиков: ${items.length}${d.note ? ` (${d.note})` : ""}${rows.length ? "\n" + rows.join("\n") : ""}`, d);
   });
 
