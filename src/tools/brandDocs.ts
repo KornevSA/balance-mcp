@@ -7,6 +7,8 @@
 //   GET /customers/{id}/contract?format=&brend_id=&section=       → get_customer_contract_document
 //   GET /contracts/{id}/document?format=&section=                 → get_contract_document
 //        (любой договор клиента по записи, balance: class/ContractDocs.php)
+//   POST /contracts/{id}/document {format}                        → attach_contract_document
+//        (тот же файл — во вложения договора, копия отправленного клиенту)
 //
 // text — JSON с разделами (n, title, text); pdf/docx/html — файл, его отдаём временной
 // ссылкой (как deliverFile), а что именно собрано (по записи договора или проект), balance
@@ -269,5 +271,42 @@ export function registerBrandDocTools(server: McpServer) {
     if (!env.ok) return fail(errorText(env.error));
     const n = env.data?.sections?.length ?? 0;
     return textResult(`«${env.data?.name ?? "Договор"}», contract_id ${a.contract_id}, ${a.section ? `раздел ${a.section}` : `разделов ${n}`}.`, env.data);
+  });
+
+  server.registerTool("attach_contract_document", {
+    title: "Прикрепить договор файлом к договору",
+    description:
+      "Собрать договор клиента по записи (как get_contract_document) и ПРИКРЕПИТЬ файл во вложения этого договора " +
+      "в balance — копия того, что ушло клиенту: сам договор собирается заново при каждом открытии и меняется вместе " +
+      "с шаблоном и карточкой, а вложение остаётся как было. То же, что галочка «прикрепить к договору» у кнопок " +
+      "PDF/DOCX в карточке. Вызывайте, когда отправляете договор клиенту; просто прочитать или показать — " +
+      "get_contract_document (он ничего не сохраняет). Возвращает file_id вложения и временную ссылку на файл — её " +
+      "можно отдать клиенту. Не хватает реквизитов в карточке — ошибка со списком полей, ничего не сохраняется. " +
+      "Права: запись файлов контрагента (files:write + customer.edit).",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    inputSchema: {
+      contract_id: z.number().int().positive().describe("contract_id (list_contracts)"),
+      format: z.enum(["pdf", "docx"]).default("pdf").describe("pdf — отправить клиенту; docx — на правку"),
+    },
+  }, async (a, extra) => {
+    const token = tokenOf(extra);
+    const env = await balanceCall(token, "POST", `/contracts/${a.contract_id}/document`, { format: a.format },
+      { timeoutMs: RENDER_TIMEOUT_MS });
+    if (!env.ok) return fail(errorText(env.error));
+    const d = env.data ?? {};
+    const head = [
+      `Договор прикреплён к договору balance (contract_id ${a.contract_id}): вложение file_id ${d.file_id} `
+        + `«${d.name ?? d.filename ?? "договор"}»${d.size_bytes ? `, ${humanSize(Number(d.size_bytes))}` : ""}.`,
+      ...describeMeta(d.meta),
+    ];
+    // Ссылка на только что сохранённое вложение — тот же файл, что лёг в договор.
+    const file = d.file_id ? await fileResult(token, `/files/${d.file_id}/content`, d.filename ?? `Договор ${a.contract_id}.${a.format}`, extra, false) : null;
+    const fileText = file && !(file as any).isError ? String((file as any).content?.[0]?.text ?? "") : "";
+    const fileErr = file && (file as any).isError ? `Ссылку получить не удалось: ${String((file as any).content?.[0]?.text ?? "")} — файл в договоре есть, скачайте get_customer_file(${d.file_id}).` : "";
+    const out: any = {
+      content: [{ type: "text" as const, text: [...head, fileText || fileErr].filter(Boolean).join("\n") }],
+      structuredContent: { ...d, link: (file as any)?.structuredContent ?? null },
+    };
+    return out;
   });
 }
