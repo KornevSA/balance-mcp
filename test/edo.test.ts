@@ -533,3 +533,133 @@ test("правка документа: нужно хотя бы одно пол�
   assert.match(textOf(r), /onec_not_balance_document/);
   assert.equal(calls[0].body.post, true);
 });
+
+// ---------------------------------------------------------------- ЭДО: черновики (11.11.2026)
+const draftPreview = (over: any = {}) => ({ provider: "saby", provider_name: "СБИС", kind: "upd", kind_name: "УПД", org_id: ORG_ID, organization: "ООО \"Интер\"",
+  doc_id: 9002, onec_id: UID, customer_id: 900, number: "957", date: "2026-10-31", total: 12200, vat: 2200, function: "СЧФДОП",
+  counteragent: { inn: "7700000001", kpp: "770001001", name: "ООО Клиент", participant_id: "2BEca1" },
+  upd: { function: "СЧФДОП", number_from: "счёт-фактура ИН00-0000957", basis: "Договор № 5531 от 01.03.2025", items: [{ line: 1 }] },
+  file: { name: "ON_NSCHFDOPPR_x.xml", size: 4096, from: "1С → XML 5.03 balance" }, warnings: ["1С может отправить этот УПД и через Диадок"],
+  blockers: [], existing: [], where: "Saby → «Документы» → исходящие", created: false, can_create: true, ...over });
+
+test("create_edo_draft: по умолчанию СБИС — превью, токен, черновик с теми же полями", async () => {
+  route("POST", "/edo/drafts", (c) => c.body.dry_run
+    ? okEnv(draftPreview())
+    : okEnv(draftPreview({ created: true, draft: { id: 17, state: "draft", link: "https://online.sbis.ru/opendoc.html?guid=1" } })));
+  const p = await callTool("create_edo_draft", { doc_id: 9002 });
+  assert.equal(p.isError, undefined, textOf(p));
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].body, { provider: "saby", doc_id: 9002, dry_run: true, source: "MCP" });
+  const tok = tokenFrom(p);
+  assert.ok(tok, "в превью есть токен");
+  assert.match(textOf(p), /СБИС \(Saby\): УПД № 957 от 2026-10-31/);
+  assert.match(textOf(p), /номер — счёт-фактура ИН00-0000957/);
+  assert.match(textOf(p), /⚠ 1С может отправить/);
+  const r = await callTool("create_edo_draft", { doc_id: 9002, confirm: tok });
+  assert.equal(r.isError, undefined, textOf(r));
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1].body, { provider: "saby", doc_id: 9002, dry_run: false, source: "MCP" });
+  assert.match(textOf(r), /Черновик #17 положен/);
+  assert.match(textOf(r), /https:\/\/online\.sbis\.ru/);
+});
+
+test("create_edo_draft: токен от СБИС не подходит к Диадоку — balance не зовётся", async () => {
+  route("POST", "/edo/drafts", okEnv(draftPreview()));
+  const p = await callTool("create_edo_draft", { doc_id: 9002 });
+  calls = [];
+  const r = await callTool("create_edo_draft", { doc_id: 9002, provider: "diadoc", confirm: tokenFrom(p) });
+  assert.equal(r.isError, true);
+  assert.match(textOf(r), /Токен подтверждения/);
+  assert.equal(calls.length, 0);
+});
+
+test("create_edo_draft: блокеры — ошибка без токена; Диадок и источник 1С уходят в тело", async () => {
+  route("POST", "/edo/drafts", okEnv(draftPreview({ provider: "diadoc", can_create: false,
+    blockers: ["Клиент в Диадоке не наш контрагент (приглашение отправлено, ответа нет) — черновик не кладём"] })));
+  const r = await callTool("create_edo_draft", { provider: "diadoc", org_id: ORG_ID, onec_id: UID.toUpperCase() });
+  assert.equal(r.isError, true);
+  assert.match(textOf(r), /не наш контрагент/);
+  assert.equal(tokenFrom(r), undefined);
+  assert.deepEqual(calls[0].body, { provider: "diadoc", org_id: ORG_ID, onec_id: UID, dry_run: true, source: "MCP" });
+});
+
+test("create_edo_draft: doc_id вместе с onec_id или без источника — отказ без вызова balance", async () => {
+  const a = await callTool("create_edo_draft", { doc_id: 1, org_id: ORG_ID, onec_id: UID });
+  const b = await callTool("create_edo_draft", { provider: "saby" });
+  assert.equal(a.isError, true);
+  assert.equal(b.isError, true);
+  assert.equal(calls.length, 0);
+});
+
+test("create_edo_draft: договор balance — kind, contract_id и реквизиты уходят в тело, токен привязан к ним", async () => {
+  const preview = draftPreview({ kind: "contract", kind_name: "Договор", doc_id: null, onec_id: null, file_id: 9101, contract_id: 9101,
+    number: "5531/26", date: "2026-03-01", total: 120000, vat: null, function: null, upd: null, need_signature: true,
+    contract: { contract_id: 9101, number: "5531/26", date: "2026-03-01" },
+    file: { name: "Договор 5531-26.docx", size: 20480, from: "файл balance #9101 (договор 9101)" }, warnings: [] });
+  route("POST", "/edo/drafts", (c) => c.body.dry_run ? okEnv(preview)
+    : okEnv({ ...preview, created: true, draft: { id: 21, state: "draft", link: "https://online.sbis.ru/opendoc.html?guid=2" } }));
+  const p = await callTool("create_edo_draft", { contract_id: 9101, total: 120000 });
+  assert.equal(p.isError, undefined, textOf(p));
+  assert.deepEqual(calls[0].body, { provider: "saby", contract_id: 9101, total: 120000, dry_run: true, source: "MCP" });
+  assert.match(textOf(p), /Договор № 5531\/26 от 2026-03-01/);
+  assert.match(textOf(p), /Договор 5531-26\.docx/);
+  const tok = tokenFrom(p);
+  const other = await callTool("create_edo_draft", { contract_id: 9101, total: 99, confirm: tok });
+  assert.equal(other.isError, true, "другая сумма — токен не подходит");
+  assert.equal(calls.length, 1);
+  const r = await callTool("create_edo_draft", { contract_id: 9101, total: 120000, confirm: tok });
+  assert.equal(r.isError, undefined, textOf(r));
+  assert.deepEqual(calls[1].body, { provider: "saby", contract_id: 9101, total: 120000, dry_run: false, source: "MCP" });
+  assert.match(textOf(r), /Черновик #21 положен/);
+});
+
+test("create_edo_draft: произвольный документ в Диадок — need_signature и org_id в теле", async () => {
+  route("POST", "/edo/drafts", okEnv(draftPreview({ provider: "diadoc", kind: "document", kind_name: "Документ", doc_id: null, onec_id: null,
+    file_id: 9108, number: "", date: "2026-11-13", total: null, vat: null, function: null, upd: null, need_signature: true, warnings: [],
+    file: { name: "Акт приёма-передачи.pdf", size: 1024, from: "файл balance #9108 (клиента)" } })));
+  const p = await callTool("create_edo_draft", { provider: "diadoc", kind: "document", file_id: 9108, org_id: ORG_ID, need_signature: true });
+  assert.equal(p.isError, undefined, textOf(p));
+  assert.deepEqual(calls[0].body, { provider: "diadoc", kind: "document", file_id: 9108, org_id: ORG_ID, need_signature: true, dry_run: true, source: "MCP" });
+  assert.match(textOf(p), /Документ № — от 2026-11-13/);
+  assert.match(textOf(p), /Подпись получателя: запрошена/);
+});
+
+test("create_edo_draft: файл без kind, реквизиты без файла, файл вместе с doc_id — отказ без вызова balance", async () => {
+  const a = await callTool("create_edo_draft", { file_id: 9105 });
+  const b = await callTool("create_edo_draft", { doc_id: 9001, number: "1" });
+  const c = await callTool("create_edo_draft", { doc_id: 9001, file_id: 9105, kind: "letter" });
+  assert.equal(a.isError, true);
+  assert.match(textOf(a), /укажите kind/);
+  assert.equal(b.isError, true);
+  assert.equal(c.isError, true);
+  assert.equal(calls.length, 0);
+});
+
+test("delete_edo_draft: превью DELETE ?dry_run=1, затем DELETE с токеном", async () => {
+  const dr = { id: 17, provider: "saby", kind_name: "УПД", number: "957", date: "2026-10-31", counteragent: { name: "ООО Клиент", inn: "7700000001" }, state: "draft" };
+  route("DELETE", "/edo/drafts/17", (c) => c.path.includes("dry_run=1")
+    ? okEnv({ dry_run: true, draft: dr, already_gone: false })
+    : okEnv({ dry_run: false, deleted: true, already_gone: false, draft: { ...dr, state: "deleted" } }));
+  const p = await callTool("delete_edo_draft", { draft_id: 17 });
+  assert.equal(p.isError, undefined, textOf(p));
+  assert.equal(calls[0].method, "DELETE");
+  assert.equal(calls[0].path, "/edo/drafts/17?dry_run=1");
+  const r = await callTool("delete_edo_draft", { draft_id: 17, confirm: tokenFrom(p) });
+  assert.equal(r.isError, undefined, textOf(r));
+  assert.equal(calls[1].path, "/edo/drafts/17");
+  assert.match(textOf(r), /удалён/);
+  const bad = await callTool("delete_edo_draft", { draft_id: 18, confirm: tokenFrom(p) });
+  assert.equal(bad.isError, true);
+  assert.equal(calls.length, 2);
+});
+
+test("list_edo_drafts: фильтры в query, строки со ссылкой у лежащих", async () => {
+  route("GET", "/edo/drafts", okEnv({ items: [{ id: 3, provider: "diadoc", kind_name: "Счёт", number: "777001", date: "2026-11-11", state: "draft",
+    counteragent: { name: "ООО Клиент", inn: "7700000001" }, doc_id: 9001, link: null }] }));
+  const r = await callTool("list_edo_drafts", { doc_id: 9001, state: "draft" });
+  assert.equal(r.isError, undefined, textOf(r));
+  const q = query(calls[0]);
+  assert.equal(q.get("doc_id"), "9001");
+  assert.equal(q.get("state"), "draft");
+  assert.match(textOf(r), /#3 Диадок: Счёт № 777001/);
+});
