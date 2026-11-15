@@ -71,6 +71,31 @@ test("update_contract: схема не пускает дату не в ГГГГ-
   assert.equal(calls.length, 0);
 });
 
+test("attach_file_to_contract: POST file_id, имя файла в ответе", async () => {
+  reply = { status: 200, json: { ok: true, data: { contract_id: 2863, attached: true, changed: true,
+    file: { file_id: 9301, name: "МИАЦ подписанный договор.pdf", ext: "pdf" } } } };
+  const r = await callTool("attach_file_to_contract", { contract_id: 2863, file_id: 9301 });
+  assert.deepEqual(calls, [{ method: "POST", path: "/contracts/2863/files", body: { file_id: 9301 } }]);
+  assert.equal(textOf(r).split("\n")[0], "Файл #9301 «МИАЦ подписанный договор.pdf» прикреплён к договору #2863");
+});
+
+test("attach_file_to_contract: повтор — «уже прикреплён»; 409 другого договора — сообщение balance", async () => {
+  reply = { status: 200, json: { ok: true, data: { contract_id: 2863, attached: true, changed: false, file: { file_id: 9301, name: "скан.pdf" } } } };
+  assert.match(textOf(await callTool("attach_file_to_contract", { contract_id: 2863, file_id: 9301 })), /^Файл #9301 «скан\.pdf» уже прикреплён к договору #2863/);
+  reply = { status: 409, json: { ok: false, error: { code: "conflict", message: "Файл уже прикреплён к договору № 51730-1 (contract_id 2900)" } } };
+  const r = await callTool("attach_file_to_contract", { contract_id: 2863, file_id: 9301 });
+  assert.equal(r.isError, true);
+  assert.match(textOf(r), /contract_id 2900/);
+});
+
+test("list_contract_files и detach_file_from_contract: пути и методы", async () => {
+  reply = { status: 200, json: { ok: true, data: { contract_id: 2863, items: [{ file_id: 1 }, { file_id: 2 }], total: 2 } } };
+  assert.match(textOf(await callTool("list_contract_files", { contract_id: 2863 })), /^Файлов у договора #2863: 2/);
+  reply = { status: 200, json: { ok: true, data: { contract_id: 2863, file_id: 2, attached: false } } };
+  assert.match(textOf(await callTool("detach_file_from_contract", { contract_id: 2863, file_id: 2 })), /откреплён от договора #2863 \(остался в файлах контрагента\)/);
+  assert.deepEqual(calls.map((c) => `${c.method} ${c.path}`), ["GET /contracts/2863/files", "DELETE /contracts/2863/files/2"]);
+});
+
 test("update_contract: без изменений — так и пишет", async () => {
   reply = { status: 200, json: { ok: true, data: { contract_id: 7, changes: {}, warnings: [] } } };
   const r = await callTool("update_contract", { id: 7, comment: "x" });

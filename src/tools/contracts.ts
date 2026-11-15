@@ -68,4 +68,58 @@ export function registerContractTools(server: McpServer) {
     const warn = (env.data?.warnings ?? []).length ? " ⚠ см. warnings" : "";
     return ok(changed.length ? `Договор #${id} изменён (${changed.join(", ")})${warn}` : `Договор #${id}: изменений нет`, env.data);
   });
+
+  // Вложения договора (balance: files.contract_id — «Файлы» карточки договора).
+  server.registerTool("list_contract_files", {
+    title: "Файлы договора",
+    description:
+      "Вложения договора: подписанные сканы, правленые docx, сохранённые выгрузки (attach_contract_document). " +
+      "Скачать — get_customer_file по file_id. Подписан ли договор, смотрите по статусу (get_contract), " +
+      "наличие скана само по себе статус не меняет.",
+    inputSchema: { contract_id: z.number().int().positive().describe("contract_id (list_contracts)") },
+  }, async (a, extra) => {
+    const env = await balanceCall(tokenOf(extra), "GET", `/contracts/${a.contract_id}/files`);
+    if (!env.ok) return fail(env.error.message);
+    return ok(`Файлов у договора #${a.contract_id}: ${env.data?.total ?? 0}`, env.data);
+  });
+
+  server.registerTool("attach_file_to_contract", {
+    title: "Прикрепить файл к договору",
+    description:
+      "Прикрепить УЖЕ ЗАГРУЖЕННЫЙ файл контрагента к его договору — прежде всего подписанный клиентом экземпляр " +
+      "(скан, PDF с подписью, правленый docx). Байты сюда не передаются: сначала файл контрагенту — " +
+      "create_customer_upload_link (вложение из чата, файл пользователя), upload_customer_file_from_url или " +
+      "upload_customer_file, потом этот вызов с file_id. Файл обязан принадлежать тому же контрагенту. " +
+      "У вложения один договор: файл, уже прикреплённый к другому договору, вернёт ошибку с его contract_id. " +
+      "Статус договора НЕ меняется — если договор теперь подписан обеими сторонами, отдельно " +
+      "update_contract(contract_status=2). Файл появится в «Файлах» карточки договора в balance.",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    inputSchema: {
+      contract_id: z.number().int().positive().describe("contract_id (list_contracts)"),
+      file_id: z.number().int().positive().describe("Файл контрагента (list_customer_files или ответ загрузки)"),
+    },
+  }, async (a, extra) => {
+    const env = await balanceCall(tokenOf(extra), "POST", `/contracts/${a.contract_id}/files`, { file_id: a.file_id });
+    if (!env.ok) return fail(env.error.message);
+    const name = env.data?.file?.name ? ` «${env.data.file.name}»` : "";
+    return ok(env.data?.changed === false
+      ? `Файл #${a.file_id}${name} уже прикреплён к договору #${a.contract_id}`
+      : `Файл #${a.file_id}${name} прикреплён к договору #${a.contract_id}`, env.data);
+  });
+
+  server.registerTool("detach_file_from_contract", {
+    title: "Открепить файл от договора",
+    description:
+      "Снять файл с договора — например, прикрепили не к тому договору. Сам файл НЕ удаляется и остаётся в " +
+      "файлах контрагента; потом его можно прикрепить к нужному договору (attach_file_to_contract).",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    inputSchema: {
+      contract_id: z.number().int().positive().describe("contract_id"),
+      file_id: z.number().int().positive().describe("file_id вложения (list_contract_files)"),
+    },
+  }, async (a, extra) => {
+    const env = await balanceCall(tokenOf(extra), "DELETE", `/contracts/${a.contract_id}/files/${a.file_id}`);
+    if (!env.ok) return fail(env.error.message);
+    return ok(`Файл #${a.file_id} откреплён от договора #${a.contract_id} (остался в файлах контрагента)`, env.data);
+  });
 }
