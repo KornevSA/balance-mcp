@@ -9,7 +9,8 @@ import { z } from "zod";
 type Reply = { status: number; json?: any; body?: Buffer; headers?: Record<string, string> };
 let server: http.Server;
 let paths: string[] = [];
-let reply: Reply = { status: 200, json: { ok: true, data: {} } };
+let reply: Reply | ((path: string, method: string, body: string) => Reply) = { status: 200, json: { ok: true, data: {} } };
+let bodies: string[] = [];
 const tools = new Map<string, { def: any; h: (a: any, extra: any) => Promise<any> }>();
 const extra = { authInfo: { token: "tkn-user" }, requestInfo: { headers: { host: "balance.test", "x-forwarded-proto": "https" } } };
 
@@ -22,14 +23,21 @@ const textOf = (r: any) => String(r?.content?.[0]?.text ?? "");
 
 before(async () => {
   server = http.createServer((req, res) => {
-    paths.push((req.url || "").replace(/^\/api\/v1/, ""));
-    if (reply.body) {
-      res.writeHead(reply.status, reply.headers ?? {});
-      res.end(reply.body);
-      return;
-    }
-    res.writeHead(reply.status, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(reply.json));
+    const path = (req.url || "").replace(/^\/api\/v1/, "");
+    paths.push(req.method === "GET" ? path : `${req.method} ${path}`);
+    let raw = "";
+    req.on("data", (c) => { raw += c; });
+    req.on("end", () => {
+      bodies.push(raw);
+      const r = typeof reply === "function" ? reply(path, req.method || "GET", raw) : reply;
+      if (r.body) {
+        res.writeHead(r.status, r.headers ?? {});
+        res.end(r.body);
+        return;
+      }
+      res.writeHead(r.status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(r.json));
+    });
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
   process.env.BALANCE_API_BASE = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/v1`;
@@ -37,7 +45,7 @@ before(async () => {
   (await import("../src/tools/brandDocs.js")).registerBrandDocTools(fake);
 });
 after(() => { server.close(); });
-beforeEach(() => { paths = []; });
+beforeEach(() => { paths = []; bodies = []; });
 
 test("get_brand_document: описание, исполнитель, НДС и число разделов в шапке", async () => {
   reply = { status: 200, json: { ok: true, data: {
@@ -164,6 +172,41 @@ test("get_contract_document: договор-оферта — 409 с объясн
   const r = await callTool("get_contract_document", { contract_id: 77, format: "pdf" });
   assert.equal(r.isError, true);
   assert.match(textOf(r), /договор-оферта: печатной формы нет.*\[offer_no_print_form\]/);
+});
+
+test("attach_contract_document: POST с форматом, затем ссылка на сохранённое вложение", async () => {
+  reply = (path, method) => {
+    if (method === "POST") return { status: 201, json: { ok: true, data: {
+      contract_id: 2863, customer_id: 51730, file_id: 9301, name: "Договор № 51730 от 10.11.2026.pdf",
+      filename: "RouterAI.ru — Договор № 51730 от 10.11.2026 — ГБУЗ АО «МИАЦ».pdf", format: "pdf", size_bytes: 291583,
+      download_url: "/api/v1/files/9301/content",
+      meta: { source: "record", contract_id: 2863, contract_number: "51730", contract_date: "10.11.2026", contract_status: 2 } } } };
+    return { status: 200, body: Buffer.alloc(3000, 1), headers: { "Content-Type": "application/pdf",
+      "Content-Disposition": `attachment; filename="x.pdf"; filename*=UTF-8''${encodeURIComponent("Договор № 51730 от 10.11.2026.pdf")}` } };
+  };
+  const r = await callTool("attach_contract_document", { contract_id: 2863 });
+  assert.deepEqual(paths, ["POST /contracts/2863/document", "/files/9301/content"]);
+  assert.deepEqual(JSON.parse(bodies[0]), { format: "pdf" });
+  const t = textOf(r);
+  assert.match(t.split("\n")[0], /^Договор прикреплён к договору balance \(contract_id 2863\): вложение file_id 9301 «Договор № 51730 от 10\.11\.2026\.pdf», 285 КБ\.$/);
+  assert.match(t, /статус «действует»/);
+  assert.match(t, /Ссылка .*: https:\/\/balance\.test\/mcp\/file\/[0-9a-f]{48}\//);
+  assert.equal(r.structuredContent.file_id, 9301);
+  assert.equal(r.structuredContent.link.name, "Договор № 51730 от 10.11.2026.pdf");
+});
+
+test("attach_contract_document: docx; 422 missing_fields — ничего не скачиваем, поля в ошибке", async () => {
+  reply = { status: 422, json: { ok: false, error: { code: "missing_fields",
+    message: "Для договора не хватает реквизитов клиента: КПП", fields: { kpp: "КПП" } } } };
+  const r = await callTool("attach_contract_document", { contract_id: 5, format: "docx" });
+  assert.deepEqual(paths, ["POST /contracts/5/document"]);
+  assert.deepEqual(JSON.parse(bodies[0]), { format: "docx" });
+  assert.equal(r.isError, true);
+  assert.match(textOf(r), /\[missing_fields\] — не хватает: КПП\. Спросите эти данные у клиента/);
+});
+
+test("attach_contract_document: html и text не принимаются схемой", async () => {
+  assert.throws(() => z.object(tools.get("attach_contract_document")!.def.inputSchema).parse({ contract_id: 1, format: "text" }));
 });
 
 test("ошибка JSON-ручки: render_unavailable — пометка, что это сбой balance", async () => {
