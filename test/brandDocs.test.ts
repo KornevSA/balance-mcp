@@ -119,6 +119,53 @@ test("get_customer_contract_document: text по записи не в стату�
   assert.match(textOf(r), /Договор клиента по записи balance \(contract_id 2863\): № 51730 от 10\.11\.2026, статус «на подписании» — договор ещё НЕ действует/);
 });
 
+test("get_contract_document: PDF по умолчанию — ссылка, договор по записи со статусом первой строкой", async () => {
+  reply = { status: 200, body: Buffer.alloc(4096, 1), headers: {
+    "Content-Type": "application/pdf",
+    "Content-Disposition": `attachment; filename="x.pdf"; filename*=UTF-8''${encodeURIComponent("NotiSend.ru — Договор № 29058-3 от 27.12.2025 — ООО «Ромашка».pdf")}`,
+    "X-Contract-Source": "record",
+    "X-Contract-Id": "1564",
+    "X-Contract-Number": encodeURIComponent("29058-3"),
+    "X-Contract-Date": "27.12.2025",
+    "X-Contract-Status": "2",
+    "X-Contract-Type": "email",
+  } };
+  const r = await callTool("get_contract_document", { contract_id: 1564 });
+  assert.deepEqual(paths, ["/contracts/1564/document?format=pdf"]);
+  const t = textOf(r);
+  assert.equal(t.split("\n")[0], "Договор клиента по записи balance (contract_id 1564): № 29058-3 от 27.12.2025, статус «действует».");
+  assert.match(t, /Ссылка .*: https:\/\/balance\.test\/mcp\/file\/[0-9a-f]{48}\//);
+  assert.equal(r.structuredContent.name, "NotiSend.ru — Договор № 29058-3 от 27.12.2025 — ООО «Ромашка».pdf");
+  assert.equal(r.structuredContent.meta.contract_id, 1564);
+});
+
+test("get_contract_document: text с разделом; section у файла — отказ без вызова balance", async () => {
+  reply = { status: 200, json: { ok: true, data: { contract_id: 1564, name: "Email",
+    meta: { source: "record", contract_id: 1564, customer_id: 29058, contract_number: "29058-3", contract_date: "27.12.2025",
+      contract_status: 1, contract_type: "email", type_name: "Email", brend_id: 2 },
+    sections: [{ n: 2, title: "1. ТЕРМИНЫ И ОПРЕДЕЛЕНИЯ", text: "1.1. «Сервис»…" }] } } };
+  const r = await callTool("get_contract_document", { contract_id: 1564, format: "text", section: 2 });
+  assert.deepEqual(paths, ["/contracts/1564/document?format=text&section=2"]);
+  const t = textOf(r);
+  assert.match(t, /^«Email», contract_id 1564, раздел 2\./);
+  assert.match(t, /статус «на подписании» — договор ещё НЕ действует/);
+  assert.match(t, /## 2\. 1\. ТЕРМИНЫ И ОПРЕДЕЛЕНИЯ\n1\.1\. «Сервис»…/);
+
+  paths = [];
+  const r2 = await callTool("get_contract_document", { contract_id: 1564, format: "docx", section: 2 });
+  assert.equal(r2.isError, true);
+  assert.equal(paths.length, 0);
+});
+
+test("get_contract_document: договор-оферта — 409 с объяснением", async () => {
+  reply = { status: 409, body: Buffer.from(JSON.stringify({ ok: false, error: { code: "offer_no_print_form",
+    message: "Это договор-оферта: печатной формы нет, текст оферты опубликован на сайте" } })),
+    headers: { "Content-Type": "application/json" } };
+  const r = await callTool("get_contract_document", { contract_id: 77, format: "pdf" });
+  assert.equal(r.isError, true);
+  assert.match(textOf(r), /договор-оферта: печатной формы нет.*\[offer_no_print_form\]/);
+});
+
 test("ошибка JSON-ручки: render_unavailable — пометка, что это сбой balance", async () => {
   reply = { status: 502, json: { ok: false, error: { code: "render_unavailable", message: "Генератор договора недоступен (HTTP 500)" } } };
   const r = await callTool("get_brand_contract_blank", { brend_id: 3 });

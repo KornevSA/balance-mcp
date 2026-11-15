@@ -5,6 +5,8 @@
 //   GET /brands/{id}/documents                                   → get_brand_document
 //   GET /brands/{id}/documents/contract?format=&section=          → get_brand_contract_blank
 //   GET /customers/{id}/contract?format=&brend_id=&section=       → get_customer_contract_document
+//   GET /contracts/{id}/document?format=&section=                 → get_contract_document
+//        (любой договор клиента по записи, balance: class/ContractDocs.php)
 //
 // text — JSON с разделами (n, title, text); pdf/docx/html — файл, его отдаём временной
 // ссылкой (как deliverFile), а что именно собрано (по записи договора или проект), balance
@@ -224,7 +226,8 @@ export function registerBrandDocTools(server: McpServer) {
       "не выдавайте за подписанный договор, а при действующем договоре другой формы не говорите, что договора нет. " +
       "Бренд — brend_id или основной дилер клиента. format: text — разделами (section=N — один); pdf | docx | html — " +
       "файл ссылкой. Не хватает реквизитов в карточке — ошибка со списком полей. Печать и подпись не ставятся. " +
-      "Только по документу бренда по умолчанию (get_brand_document); договоры других форм так не собрать.",
+      "Только по документу бренда по умолчанию (get_brand_document); договор клиента другой формы, редакции или " +
+      "бренда — get_contract_document по contract_id.",
     inputSchema: {
       customer_id: z.number().int().positive().describe("customer_id"),
       format: formatSchema.describe("text — читать и сравнивать; pdf | docx | html — файл для клиента"),
@@ -239,5 +242,32 @@ export function registerBrandDocTools(server: McpServer) {
     if (!env.ok) return fail(errorText(env.error));
     const n = env.data?.sections?.length ?? 0;
     return textResult(`«${env.data?.name ?? "Договор"}» на КА #${a.customer_id}, ${a.section ? `раздел ${a.section}` : `разделов ${n}`}.`, env.data);
+  });
+
+  server.registerTool("get_contract_document", {
+    title: "Договор клиента по записи",
+    description:
+      "Сам договор клиента по его записи в balance (contract_id — из list_contracts): то же, что «Просмотр» и " +
+      "кнопки PDF/DOCX в карточке договора. Форма, номер, дата, исполнитель, бренд и НДС — из записи, поэтому " +
+      "годится для любого договора клиента: старой редакции, другой формы, другого бренда (get_customer_contract_document " +
+      "даёт только типовой договор бренда). Статус — в первой строке ответа: не «действует» — не называйте договор " +
+      "подписанным. format: text — разделами (section=N — один), чтобы отвечать по условиям или сравнить с редакцией " +
+      "клиента; pdf | docx | html — файл временной ссылкой (отправить клиенту, отдать на правку в Word). Не хватает " +
+      "реквизитов в карточке — ошибка со списком полей. Печать и подпись не ставятся. У договора-оферты печатной " +
+      "формы нет — текст оферты на сайте.",
+    inputSchema: {
+      contract_id: z.number().int().positive().describe("contract_id (list_contracts)"),
+      format: formatSchema.default("pdf").describe("pdf | docx | html — файл для клиента; text — читать и сравнивать"),
+      section: z.number().int().positive().optional()
+        .describe("Только для format=text: номер раздела; без него — весь договор"),
+    },
+  }, async (a, extra) => {
+    if (a.section !== undefined && a.format !== "text") return fail("section — только для format=text.");
+    const path = `/contracts/${a.contract_id}/document` + qs({ format: a.format, section: a.section });
+    if (a.format !== "text") return fileResult(tokenOf(extra), path, `Договор ${a.contract_id}.${a.format}`, extra, true);
+    const env = await balanceCall(tokenOf(extra), "GET", path, undefined, { timeoutMs: RENDER_TIMEOUT_MS });
+    if (!env.ok) return fail(errorText(env.error));
+    const n = env.data?.sections?.length ?? 0;
+    return textResult(`«${env.data?.name ?? "Договор"}», contract_id ${a.contract_id}, ${a.section ? `раздел ${a.section}` : `разделов ${n}`}.`, env.data);
   });
 }
