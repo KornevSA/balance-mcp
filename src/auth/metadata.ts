@@ -6,6 +6,10 @@ export const SCOPES_SUPPORTED = [
   "customers:write",
   "invoices:write",
   "documents:read",
+  // Выдача/отзыв публичной ссылки на документ (balance миграция 155): одного
+  // documents:read для неё больше мало. Без него в списке Claude не запросит
+  // скоуп и после переподключения.
+  "documents:share",
   "files:read",
   "files:write",
   "me:files:read",
