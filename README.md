@@ -19,6 +19,7 @@ TypeScript + `@modelcontextprotocol/sdk`, транспорт **streamable HTTP**
 | `get_customer_settlement` | **взаиморасчёты** (сальдо/обороты, поступления/реализации) |
 | `find_missing_acts` | **детектор забытых актов** на конец месяца |
 | `list_customer_files`, `get_customer_file` | файлы контрагента |
+| `get_brand_document`, `get_brand_contract_blank`, `get_customer_contract_document` | **типовой договор бренда** («Шаблоны документов» balance): исполнитель, НДС и оглавление; бланк и договор, заполненный на контрагента — `text` по разделам (`section=N`) или `pdf`/`docx`/`html` ссылкой; первая строка ответа — что собрано (бланк, договор клиента по записи со статусом или ПРОЕКТ) и другие договоры клиента. Описание и бланк — скоуп `organizations:read` или `customers:read` (пользователю — ещё право `doctemplates.view` или `customer.view`); договор на контрагента — `customers:read` + `customer.view` и зона дилера |
 | `list_my_files`, `get_my_file`, `upload_my_file` | личные «Мои файлы» |
 | `list_onec_bases`, `get_onec_meta` | **1С (только чтение)**: базы по организациям (`org_id`), справочники базы |
 | `search_onec_counterparties`, `get_onec_counterparty`, `get_onec_settlement` | контрагенты 1С (в том числе по `customer_id` balance) и сальдо 60/62/76 по данным бухгалтерии |
