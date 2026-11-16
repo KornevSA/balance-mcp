@@ -23,7 +23,8 @@ import { publicBaseOf } from "./tools/util.js";
 /** Текстовые типы, которые не жалко продублировать в ответе тулза. */
 function isTextual(ctype: string, name: string): boolean {
   const c = (ctype || "").toLowerCase();
-  if (c.startsWith("text/") || c.includes("json") || c.includes("xml") || c.includes("csv")) return true;
+  // xml — только сам XML (application/xml, text/xml, …+xml): у DOCX/XLSX тип «…openxmlformats…» — это ZIP, не текст
+  if (c.startsWith("text/") || c.includes("json") || /(^|\/|\+)xml\s*(;|$)/.test(c) || c.includes("csv")) return true;
   return /\.(txt|csv|json|xml|md)$/i.test(name);
 }
 
@@ -40,7 +41,15 @@ export async function deliverFile(token: string, path: string, label: string, ex
     return { content: [{ type: "text" as const, text: `${label}: внешний документ доступен по ссылке: ${f.redirectUrl}` }] };
   }
   if (!f.ok) {
-    return { isError: true, content: [{ type: "text" as const, text: `Не удалось получить файл (${label}): HTTP ${f.status}` }] };
+    // balance отвечает на ошибку JSON-конвертом — показываем его текст (почему нет файла), а не только код
+    let why = f.error || "";
+    if (!why && /json/i.test(f.contentType)) {
+      try {
+        const e = JSON.parse(f.buffer.toString("utf8"))?.error;
+        if (e?.message) why = `${e.message}${e.code ? ` [${e.code}]` : ""}${e.request_id ? `, request_id ${e.request_id}` : ""}`;
+      } catch { /* не JSON — только код */ }
+    }
+    return { isError: true, content: [{ type: "text" as const, text: `Не удалось получить файл (${label}): HTTP ${f.status}${why ? ` — ${why}` : ""}` }] };
   }
 
   const name = f.filename || label;
