@@ -8,7 +8,8 @@ import type { AddressInfo } from "node:net";
 import { z } from "zod";
 
 type Call = { method: string; path: string; body: any; auth: string };
-type Reply = { status?: number; json: any } | ((c: Call) => { status?: number; json: any });
+type Out = { status?: number; json?: any; raw?: Buffer; headers?: Record<string, string> };
+type Reply = Out | ((c: Call) => Out);
 
 let server: http.Server;
 let calls: Call[] = [];
@@ -48,6 +49,7 @@ before(async () => {
       calls.push(c);
       const r = routes[`${c.method} ${c.path}`] ?? routes[`${c.method} ${c.path.split("?")[0]}`];
       const out = typeof r === "function" ? r(c) : r;
+      if (out?.raw) { res.writeHead(out.status ?? 200, out.headers ?? {}); res.end(out.raw); return; }
       res.writeHead(out?.status ?? (out ? 200 : 404), { "Content-Type": "application/json" });
       res.end(JSON.stringify(out ? out.json : { ok: false, error: { code: "not_found", message: "нет маршрута в тесте: " + c.method + " " + c.path } }));
     });
@@ -149,65 +151,183 @@ const sabyItem = (status: string, n: string) => ({ provider: "saby", document_id
   onec: { status, matches: status === "found" ? [{ id: UID, kind_name: "Поступление", number: "0000-000047", date: "2026-09-30", amount: 5718774,
     by: "incoming_number", incoming_number: "1639" }] : [], counterparties: [] } });
 
-test("list_saby_documents: provider=saby, проверка в 1С по умолчанию, строки с отметкой «в 1С»", async () => {
+test("list_saby_documents: входящие для 1С — direction=in, проверка в 1С по умолчанию, строки с отметкой «в 1С»", async () => {
   route("GET", "/edo/documents", okEnv({ provider: "saby", org_id: 3, organization: "Нотисенд, ООО", from: "2026-08-01", to: null,
-    items: [sabyItem("found", "1639"), { ...sabyItem("absent", "1700"), attachment_id: null }], has_more: false, note: null }));
-  const r = await callTool("list_saby_documents", { org_id: 3, from: "2026-08-01", counteragent_inn: "7805733652" });
+    items: [sabyItem("found", "1639"), { ...sabyItem("absent", "1700"), attachment_id: null }], has_more: false, note: null, complete: true }));
+  const r = await callTool("list_saby_documents", { org_id: 3, direction: "in", from: "2026-08-01", counteragent_inn: "7805733652" });
   assert.equal(r.isError, undefined, textOf(r));
   const q = query(calls[0]);
   assert.equal(q.get("provider"), "saby");
   assert.equal(q.get("org_id"), "3");
+  assert.equal(q.get("direction"), "in");
   assert.equal(q.get("onec_check"), "1");
   assert.equal(q.get("from"), "2026-08-01");
   assert.equal(q.get("counteragent_inn"), "7805733652");
-  assert.equal(q.get("direction"), null, "у Saby только входящие — direction не передаём");
-  assert.match(textOf(r), /Входящие Saby org 3 «Нотисенд, ООО»/);
-  assert.match(textOf(r), /нет в 1С: 1, уже в 1С: 1/);
-  assert.match(textOf(r), /УПД № 1639 от 2026-09-30 на 5.718.774.00, БК, ООО ИНН 7805733652 — уже есть в 1С: .*0000-000047.*входящий № 1639/);
+  assert.match(textOf(r), /Saby org 3 «Нотисенд, ООО», входящие/);
+  assert.match(textOf(r), /входящих нет в 1С: 1, уже в 1С: 1/);
+  assert.match(textOf(r), /Вх\. УПД № 1639 от 2026-09-30 на 5.718.774.00 — БК, ООО ИНН 7805733652; Выполнение завершено успешно — уже есть в 1С: .*0000-000047.*входящий № 1639/);
   assert.match(textOf(r), /\(вложения ещё нет\)/);
+  assert.match(textOf(r), new RegExp(`document_id ${SDOC.toLowerCase()}`));
 
   await callTool("list_saby_documents", { org_id: 3, not_in_onec: true, onec_check: false });
   assert.equal(query(calls[1]).get("not_in_onec"), "1");
+  assert.equal(query(calls[1]).get("direction"), "in", "not_in_onec — только входящие");
   assert.equal(query(calls[1]).get("onec_check"), "1", "not_in_onec включает проверку сам");
-  await callTool("list_saby_documents", { org_id: 3, onec_check: false });
+  await callTool("list_saby_documents", { org_id: 3, direction: "in", onec_check: false });
   assert.equal(query(calls[2]).get("onec_check"), null);
 
   calls = [];
   const bad = await callTool("list_saby_documents", { org_id: 3, from: "2026-09-01", to: "2026-08-01" });
   assert.equal(bad.isError, true);
+  const bad2 = await callTool("list_saby_documents", { org_id: 3, direction: "out", not_in_onec: true });
+  assert.equal(bad2.isError, true);
   assert.equal(calls.length, 0);
 });
 
-test("get_saby_document: путь с вложением и без, строки и подсказка про source=saby", async () => {
-  const doc = { ...sabyItem("found", "1639"), grounds: "Договор № 10769/09/26 от 01.09.2026", title: "Счет-фактура и УПД № 1639",
-    seller: { inn: "7805733652", kpp: "780701001", name: "ООО «БИЗНЕС-КОММУНИКАЦИИ»" }, totals: { net: 4689443, vat: 1029331, total: 5718774 },
-    lines: [{ line: 1, name: "Услуги по передаче электронных сообщений", amount: 5708108.28, vat_rate: "22%", vat_amount: 1029331 },
-            { line: 2, name: "Неисключительная лицензия на ПО", amount: 10665.72, vat_rate: "без НДС", vat_amount: 0 }], parse_note: null, onec_kind: "purchase" };
-  route("GET", `/edo/documents/${SDOC.toLowerCase()}/${SATT.toLowerCase()}`, okEnv(doc));
-  route("GET", `/edo/documents/${SDOC.toLowerCase()}`, okEnv(doc));
-  const r = await callTool("get_saby_document", { org_id: 3, document_id: SDOC, attachment_id: SATT });
+const CDOC = "89E504D2-0AFD-4B49-A3E3-F8185A5A6C95";
+const CATT = "36B4AB15-595E-432F-A4E2-075C2E4D20B5";
+const contractItem = {
+  provider: "saby", document_id: CDOC.toLowerCase(), attachment_id: CATT.toLowerCase(), direction: "out", doc_type: "ДоговорДок",
+  doc_type_name: "Договор, доп. соглашение", group: "contract", type: "", title: "Лицензионный_договор_6_ИП_Струповец_Интер_01_11_2026.docx",
+  doc_title: "Договор № 58 от 13.11.2026", attachment_names: ["Лицензионный_договор_6_ИП_Струповец_Интер_01_11_2026.docx"],
+  number: "58", date: "2026-11-13", ref_number: "6", ref_date: "2026-11-01", total: null, vat: null,
+  counteragent: { inn: "780268937816", kpp: "", name: "ИП Струповец Даниил Александрович" }, grounds: "", state: "signed",
+  status_text: "Выполнение завершено успешно", deleted: false, balance_doc_id: null, match: "number",
+  customers: [{ customer_id: 51730, name: "ИП Струповец Даниил Александрович", inn: "780268937816", kpp: "", same_kpp: false }],
+};
+
+test("list_saby_documents: все документы по умолчанию — без проверки 1С; номер, текст и типы уходят в balance; номер из файла в строке", async () => {
+  route("GET", "/edo/documents", okEnv({ provider: "saby", org_id: 2, organization: "Интер, ООО", from: "2026-11-01", to: null,
+    items: [contractItem], matched: 1, has_more: false, complete: true, note: null, request_id: "mcp-abc" }));
+  const r = await callTool("list_saby_documents", { org_id: 2, number: "6", query: "лицензионный Струповец", doc_type: ["contract", "СчетИсх"], from: "2026-11-01" });
   assert.equal(r.isError, undefined, textOf(r));
-  assert.equal(query(calls[0]).get("provider"), "saby");
-  assert.equal(query(calls[0]).get("onec_check"), null);
-  assert.match(textOf(r), /основание: Договор № 10769\/09\/26 от 01\.09\.2026/);
-  assert.match(textOf(r), /Строк: 2; итого 5.718.774.00, НДС 1.029.331.00/);
-  assert.match(textOf(r), /1\. Услуги по передаче электронных сообщений — 5.708.108.28 \(22%, НДС 1.029.331.00\)/);
-  assert.match(textOf(r), /2\. Неисключительная лицензия на ПО — 10.665.72 \(без НДС\)/);
-  assert.match(textOf(r), /уже есть в 1С/);
-  assert.match(textOf(r), new RegExp(`source=saby, document_id=${SDOC.toLowerCase()}, attachment_id=${SATT.toLowerCase()}`));
-  await callTool("get_saby_document", { org_id: 3, document_id: SDOC, onec_check: false });
-  assert.equal(calls[1].path.split("?")[0], `/edo/documents/${SDOC.toLowerCase()}`);
-  assert.equal(query(calls[1]).get("onec_check"), "0");
+  const q = query(calls[0]);
+  assert.equal(q.get("direction"), "all");
+  assert.equal(q.get("onec_check"), null, "все документы — 1С не проверяем");
+  assert.equal(q.get("number"), "6");
+  assert.equal(q.get("q"), "лицензионный Струповец");
+  assert.equal(q.get("types"), "contract,СчетИсх");
+  assert.match(textOf(r), /входящие и исходящие \(2026-11-01 — …\), тип: contract, СчетИсх, номер «6», текст «лицензионный Струповец»: 1\./);
+  assert.match(textOf(r), /Исх\. Договор, доп\. соглашение № 58 от 2026-11-13 \(в файле № 6 от 2026-11-01\) — ИП Струповец Даниил Александрович ИНН 780268937816/);
+  assert.match(textOf(r), /файл «Лицензионный_договор_6_ИП_Струповец_Интер_01_11_2026\.docx»/);
+  assert.match(textOf(r), /клиент balance #51730/);
+  assert.match(textOf(r), /request_id: mcp-abc/);
+
+  route("GET", "/edo/documents", okEnv({ provider: "saby", org_id: 2, items: [], matched: 0, complete: false,
+    note: "Saby: документы раньше 2026-11-10 типов КоррВх ещё не дочитаны — повторите запрос" }));
+  const r2 = await callTool("list_saby_documents", { org_id: 2, direction: "out" });
+  assert.equal(query(calls[1]).get("direction"), "out");
+  assert.match(textOf(r2), /⚠ Saby: документы раньше 2026-11-10 типов КоррВх ещё не дочитаны/);
+  assert.doesNotMatch(textOf(r2), /Ничего не нашлось/, "неполный список — не «ничего нет»");
 });
 
-test("get_edo_status: раздел Saby", async () => {
+test("get_saby_document: договор — вложения, документооборот, кандидаты, подсказки про файл; УПД — строки и source=saby", async () => {
+  const doc = { ...contractItem, attachments: [{ id: CATT.toLowerCase(), type: "", title: contractItem.title, file_name: contractItem.title, ext: "docx",
+      direction: "out", service: false, deleted: false, has_original: true, has_pdf: true,
+      signatures: [{ side: "our", name: "Коломойцева Полина Андреевна" }, { side: "counteragent", name: "СТРУПОВЕЦ ДАНИИЛ АЛЕКСАНДРОВИЧ" }] }],
+    service_attachments: 3, flow: { sent_at: "2026-11-13 13:56:46", delivered_at: "2026-11-13 13:57:03", received_at: null, signed_at: "2026-11-13 14:42:49",
+      signed_by: [{ name: "СТРУПОВЕЦ ДАНИИЛ АЛЕКСАНДРОВИЧ", side: "counteragent" }], rejected_at: null, reject_reason: null, revoked_at: null,
+      sender_signers: [{ name: "Коломойцева Полина Андреевна", side: "our", by_power_of_attorney: true }] },
+    events: [], lines: null, totals: {}, onec_kind: null, parse_note: "не XML УПД", org_id: 2, request_id: "mcp-d1" };
+  route("GET", `/edo/documents/${CDOC.toLowerCase()}`, okEnv(doc));
+  const r = await callTool("get_saby_document", { org_id: 2, document_id: CDOC });
+  assert.equal(r.isError, undefined, textOf(r));
+  const t = textOf(r);
+  assert.match(t, /^Исходящий Договор, доп\. соглашение № 58 от 2026-11-13 \(в файле № 6 от 2026-11-01\)/);
+  assert.match(t, /отправлен 2026-11-13 13:56:46 \(подписал Коломойцева Полина Андреевна \(мы\), по доверенности\); доставлен 2026-11-13 13:57:03; подписан 2026-11-13 14:42:49 — СТРУПОВЕЦ ДАНИИЛ АЛЕКСАНДРОВИЧ/);
+  assert.match(t, /Вложения \(1, служебных ещё 3\)/);
+  assert.match(t, /\.docx, наше, есть печатная форма, подписи: Коломойцева Полина Андреевна, СТРУПОВЕЦ ДАНИИЛ АЛЕКСАНДРОВИЧ/);
+  assert.match(t, new RegExp(`get_saby_file \\(org_id=2, document_id=${CDOC.toLowerCase()}, attachment_id=${CATT.toLowerCase()}`));
+  assert.match(t, /save_saby_file/);
+  assert.match(t, /клиент balance #51730/);
+  assert.doesNotMatch(t, /create_onec_supplier_document/, "исходящий договор — не в 1С");
+
+  const upd = { ...sabyItem("found", "1639"), grounds: "Договор № 10769/09/26 от 01.09.2026", title: "Счет-фактура и УПД № 1639",
+    seller: { inn: "7805733652", kpp: "780701001", name: "ООО «БИЗНЕС-КОММУНИКАЦИИ»" }, totals: { net: 4689443, vat: 1029331, total: 5718774 },
+    lines: [{ line: 1, name: "Услуги по передаче электронных сообщений", amount: 5708108.28, vat_rate: "22%", vat_amount: 1029331 },
+            { line: 2, name: "Неисключительная лицензия на ПО", amount: 10665.72, vat_rate: "без НДС", vat_amount: 0 }], parse_note: null, onec_kind: "purchase",
+    attachments: [], flow: {}, customers: [] };
+  route("GET", `/edo/documents/${SDOC.toLowerCase()}/${SATT.toLowerCase()}`, okEnv(upd));
+  route("GET", `/edo/documents/${SDOC.toLowerCase()}`, okEnv(upd));
+  const u = await callTool("get_saby_document", { org_id: 3, document_id: SDOC, attachment_id: SATT });
+  assert.equal(query(calls[1]).get("provider"), "saby");
+  assert.equal(query(calls[1]).get("onec_check"), null);
+  assert.match(textOf(u), /основание: Договор № 10769\/09\/26 от 01\.09\.2026/);
+  assert.match(textOf(u), /Строк УПД: 2; итого 5.718.774.00, НДС 1.029.331.00/);
+  assert.match(textOf(u), /1\. Услуги по передаче электронных сообщений — 5.708.108.28 \(22%, НДС 1.029.331.00\)/);
+  assert.match(textOf(u), /уже есть в 1С/);
+  assert.match(textOf(u), new RegExp(`source=saby, document_id=${SDOC.toLowerCase()}, attachment_id=${SATT.toLowerCase()}`));
+  await callTool("get_saby_document", { org_id: 3, document_id: SDOC, onec_check: false });
+  assert.equal(calls[2].path.split("?")[0], `/edo/documents/${SDOC.toLowerCase()}`);
+  assert.equal(query(calls[2]).get("onec_check"), "0");
+});
+
+test("get_saby_file: путь файла, форма и временная ссылка; ошибка balance — его текстом", async () => {
+  const bytes = Buffer.from("PK\u0003\u0004 docx");
+  route("GET", `/edo/documents/${CDOC.toLowerCase()}/${CATT.toLowerCase()}/file`, {
+    raw: bytes, headers: { "Content-Type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                           "Content-Disposition": `attachment; filename="x.docx"; filename*=UTF-8''${encodeURIComponent("Лицензионный_договор_6.docx")}` } });
+  const r = await callTool("get_saby_file", { org_id: 2, document_id: CDOC, attachment_id: CATT });
+  assert.equal(r.isError, undefined, textOf(r));
+  assert.equal(query(calls[0]).get("provider"), "saby");
+  assert.equal(query(calls[0]).get("org_id"), "2");
+  assert.equal(query(calls[0]).get("form"), "original");
+  assert.match(textOf(r), /Файл «Лицензионный_договор_6\.docx»/);
+  assert.match(textOf(r), /https:\/\/balance\.test\/mcp\/file\//);
+  assert.doesNotMatch(textOf(r), /Содержимое:/, "DOCX (…openxmlformats…) — ZIP, а не текст: байты в ответ не кладём");
+  assert.equal(r.structuredContent?.content, undefined);
+
+  route("GET", `/edo/documents/${CDOC.toLowerCase()}/${CATT.toLowerCase()}/file`, {
+    raw: Buffer.from("<?xml version=\"1.0\"?><Файл/>"), headers: { "Content-Type": "application/xml", "Content-Disposition": 'attachment; filename="upd.xml"' } });
+  const x = await callTool("get_saby_file", { org_id: 2, document_id: CDOC, attachment_id: CATT });
+  assert.match(textOf(x), /Содержимое:\n<\?xml/, "сам XML — текст, кладём содержимым");
+
+  route("GET", `/edo/documents/${CDOC.toLowerCase()}/file`, errEnv(404, "saby_no_file", "У вложения Saby не даёт печатную форму — возьмите form=original", { request_id: "mcp-f1" }));
+  const e = await callTool("get_saby_file", { org_id: 2, document_id: CDOC, form: "pdf" });
+  assert.equal(e.isError, true);
+  assert.equal(query(last()).get("form"), "pdf");
+  assert.match(textOf(e), /HTTP 404 — У вложения Saby не даёт печатную форму.*\[saby_no_file\], request_id mcp-f1/);
+});
+
+test("save_saby_file: тело POST, превью dry_run, сохранено к договору; несколько клиентов — кандидаты", async () => {
+  const saved = (dry: boolean, dup = false) => okEnv({ provider: "saby", org_id: 2, dry_run: dry, saved: !dry, duplicate: dup, attached: !dry,
+    document: { document_id: CDOC.toLowerCase(), title: "Договор № 58 от 13.11.2026", number: "58", date: "2026-11-13", ref_number: "6", ref_date: "2026-11-01", direction: "out" },
+    attachment: { id: CATT.toLowerCase() }, form: "original", customer: { customer_id: 51730, name: "ИП Струповец Даниил Александрович", inn: "780268937816" },
+    contract: { contract_id: 9500, number: "6", date: "2026-11-01" }, file_name: "Лицензионный_договор_6_ИП_Струповец_Интер_01_11_2026.docx", warnings: [],
+    file: dry ? null : { file_id: 777, name: "Лицензионный_договор_6.docx", download_url: "/api/v1/files/777/content" }, request_id: "mcp-s1" }, dry || dup ? 200 : 201);
+  route("POST", `/edo/documents/${CDOC.toLowerCase()}/save`, (c: Call) => saved(!!c.body?.dry_run));
+  const p = await callTool("save_saby_file", { org_id: 2, document_id: CDOC, contract_id: 9500, dry_run: true });
+  assert.equal(p.isError, undefined, textOf(p));
+  assert.deepEqual(calls[0].body, { provider: "saby", org_id: 2, contract_id: 9500, dry_run: true });
+  assert.match(textOf(p), /Будет сохранено: «Лицензионный_договор_6_ИП_Струповец_Интер_01_11_2026\.docx» из исходящего «Договор № 58 от 13\.11\.2026» \(в файле № 6 от 2026-11-01\) → клиент #51730 .*договор № 6 от 2026-11-01 \(#9500\)/);
+  assert.match(textOf(p), /Ничего не записано/);
+  const s = await callTool("save_saby_file", { org_id: 2, document_id: CDOC, contract_id: 9500, name: "Договор 6 подписанный.docx" });
+  assert.deepEqual(calls[1].body, { provider: "saby", org_id: 2, contract_id: 9500, name: "Договор 6 подписанный.docx" });
+  assert.match(textOf(s), /^Сохранено: .*file_id 777, прикреплён к договору/);
+  assert.match(textOf(s), /get_customer_file \(file_id 777\)/);
+
+  route("POST", `/edo/documents/${CDOC.toLowerCase()}/${CATT.toLowerCase()}/save`, errEnv(409, "saby_ambiguous_customer", "Клиентов balance с ИНН 7700000951 несколько — укажите customer_id",
+    { candidates: [{ customer_id: 951, name: "ООО Поставщик", kpp: "770001001" }, { customer_id: 952, name: "ООО Поставщик (дубль)", kpp: "770101001" }] }));
+  const e = await callTool("save_saby_file", { org_id: 2, document_id: CDOC, attachment_id: CATT, form: "pdf" });
+  assert.equal(e.isError, true);
+  assert.equal(calls[2].body.form, "pdf");
+  assert.match(textOf(e), /Кандидаты: #951 ООО Поставщик КПП 770001001; #952 ООО Поставщик \(дубль\) КПП 770101001/);
+});
+
+test("get_edo_status: раздел Saby — синхронизация всех документов как у Диадока, организации с индексом", async () => {
   route("GET", "/edo/status", okEnv({ provider: "diadoc", configured: true, sync_enabled: false, boxes: [],
-    providers: { saby: { provider: "saby", installed: true, configured: true, last_error: null,
-      organizations: [{ org_id: 3, organization: "ООО \"НотиСенд\"", edo_ok: true, incoming_docs: 1 }, { org_id: 2, organization: "Интер", edo_ok: false, note: "нет ЭДО" }] } } }));
+    providers: { saby: { provider: "saby", installed: true, configured: true, last_error: null, sync_enabled: true, sync_days: 30,
+      last_run_at: "2026-11-17 01:00:00", last_stats: { docs: 340, new: 12, matched: 9, more: true },
+      organizations: [{ org_id: 3, organization: "ООО \"НотиСенд\"", edo_ok: true, incoming_docs: 1, outgoing_docs: 5, index: { synced_from: "2026-10-18" } },
+                      { org_id: 2, organization: "Интер", edo_ok: false, note: "нет ЭДО" }] } } }));
   const s = await callTool("get_edo_status", {});
-  assert.match(textOf(s), /Saby: подключён/);
-  assert.match(textOf(s), /org 3 «ООО "НотиСенд"»: документооборот есть, входящих прочитано 1/);
+  assert.match(textOf(s), /Saby: подключён; фоновая синхронизация всех документов: включена \(глубина 30 дн\.\), последний запуск 2026-11-17 01:00:00, прочитано документов 340 \(новых 12\), связано с balance 9, прочитано не всё/);
+  assert.match(textOf(s), /org 3 «ООО "НотиСенд"»: документооборот есть, прочитано входящих 1, исходящих 5, полный список — с 2026-10-18/);
   assert.match(textOf(s), /org 2 «Интер»: нет документооборота — нет ЭДО/);
+  route("GET", "/edo/status", okEnv({ provider: "diadoc", configured: false, boxes: [],
+    providers: { saby: { provider: "saby", installed: true, configured: true, sync_enabled: false, sync_days: 21, organizations: [] } } }));
+  const off = await callTool("get_edo_status", {});
+  assert.match(textOf(off), /фоновая синхронизация выключена — list_saby_documents дочитывает Saby при запросе/);
 });
 
 test("list_onec_documents: вид supplier_invoice", async () => {
