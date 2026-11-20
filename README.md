@@ -12,6 +12,9 @@ TypeScript + `@modelcontextprotocol/sdk`, транспорт **streamable HTTP**
 | Tool | Назначение |
 |---|---|
 | `find_or_create_customer`, `search_customers`, `get_customer` | контрагенты (идемпотентно по ИНН; `name` необязателен — тянется из ЕГРЮЛ/ЕГРИП по ИНН) |
+| `list_customer_links`, `link_customer_to_cabinet`, `update_customer_link`, `unlink_customer_from_cabinet` | кабинеты дилеров у карточки: привязать существующую карточку, получатель платежей кабинета, основная связка, отвязать (только сотрудник OAuth с правом правки, balance `/customers/{id}/links`) |
+| `merge_customers` | слить дубль без истории в основную карточку — план и токен, затем `confirm`; карточку с документами не сливает (balance `/customers/{id}/merge`) |
+| `create_contract`, `update_contract` | завести договор (форма, организация и НДС — документа бренда клиента) и править номер, дату, название, статус, комментарий, форму, НДС, организацию |
 | `lookup_company_by_inn` | реквизиты юрлица/ИП по ИНН из ЕГРЮЛ/ЕГРИП через 1С:Контрагент (запасной — DaData), без создания КА |
 | `create_invoice` | выставить счёт (+PDF через `get_document_pdf`) |
 | `list_customer_documents`, `get_document`, `get_document_pdf` | документы и их PDF |

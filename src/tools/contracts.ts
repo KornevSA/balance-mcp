@@ -32,14 +32,56 @@ export function registerContractTools(server: McpServer) {
     return ok(`Договор #${a.id}`, env.data);
   });
 
+  server.registerTool("create_contract", {
+    title: "Завести договор",
+    description:
+      "Завести запись договора клиента в balance — черновик (0) или «на подписании» (1). Без contract_type форма, наша " +
+      "организация и НДС берутся из документа по умолчанию бренда клиента (get_brand_document; у RouterAI — " +
+      "routerai_v3, ООО «Интер», без НДС); с contract_type — организация и НДС по линейке формы. Переданные org_id и " +
+      "vat главнее. Номер по умолчанию — как в карточке (id клиента, затем <id>-1, <id>-2), дата — сегодня, название — " +
+      "«Договор». «Действует» сразу поставить нельзя: после подписания — attach_file_to_contract со сканом и " +
+      "update_contract(contract_status=2). Договор-оферту заводит balance сам. Ответ — договор, defaults_source " +
+      "(откуда взяты значения: brand_document | line | dealer | request) и warnings. Документ на клиента по записи — " +
+      "get_contract_document, файлом во вложения — attach_contract_document.",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    inputSchema: {
+      customer_id: z.number().int().positive().describe("customer_id"),
+      contract_type: z.string().min(1).max(64).optional()
+        .describe("Код печатной формы (как в карточке: routerai_v3, routerai_reseller, sms, email…); без него — документ бренда"),
+      org_id: z.number().int().positive().optional().describe("Наша организация (list_organizations); без него — по документу бренда или форме"),
+      vat: z.enum(["5", "22", "no"]).optional().describe("НДС по договору: 5, 22 или no (без НДС)"),
+      contract_number: z.string().min(1).max(50).optional().describe("Номер; без него — следующий по правилу карточки"),
+      contract_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Дата, ГГГГ-ММ-ДД; без неё — сегодня"),
+      contract_name: z.string().min(1).max(1000).optional().describe("Название: «Договор», «Лицензионный договор»…"),
+      contract_status: z.union([z.literal(0), z.literal(1)]).optional().describe("0 черновик (по умолчанию), 1 на подписании"),
+      comment: z.string().max(5000).optional(),
+    },
+  }, async (a, extra) => {
+    const body: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(a)) if (v !== undefined) body[k] = v;
+    const env = await balanceCall(tokenOf(extra), "POST", "/contracts", body);
+    if (!env.ok) {
+      const errs = env.error.errors && typeof env.error.errors === "object"
+        ? Object.entries(env.error.errors).map(([k, v]) => `${k}: ${v}`).join("; ") : "";
+      return fail(errs ? `${env.error.message} — ${errs}` : env.error.message);
+    }
+    const d = env.data;
+    const warn = (d?.warnings ?? []).length ? ` ⚠ ${(d.warnings as string[]).join(" ⚠ ")}` : "";
+    return ok(`Договор #${d?.contract_id} № ${d?.contract_number} заведён у КА #${a.customer_id}: форма ${d?.contract_type}, ` +
+      `организация ${d?.org_id}, НДС ${d?.vat}, статус ${d?.contract_status}${warn}`, d);
+  });
+
   server.registerTool("update_contract", {
     title: "Изменить договор",
     description:
-      "Частично изменить договор balance (PATCH): номер, дату, название, статус, комментарий — передавайте только " +
-      "изменяемые поля. Организация, тип печатной формы, НДС и строки документов меняются только в карточке клиента. " +
+      "Частично изменить договор balance (PATCH): номер, дату, название, статус, комментарий, форму (contract_type), " +
+      "НДС (vat), нашу организацию (org_id) — передавайте только изменяемые поля. Бренд записи меняется вместе с формой; " +
+      "строки документов и «счета из ЛК» — только в карточке клиента. " +
       "Статусы: 0 черновик, 1 на подписании, 2 действует (подписан — включает правила договора: ставку НДС и строку " +
       "документов), 3 исполнен, -1 отклонён. Договор в финальном статусе (-1, 2, 3) правится только сменой статуса: " +
-      "сначала верните 0 или 1 отдельным вызовом, потом меняйте поля. Уже созданные в 1С документы остаются на " +
+      "сначала верните 0 или 1 отдельным вызовом, потом меняйте поля. Организацию не сменить, если по договору уже есть " +
+      "документы другой организации или он заведён в 1С — тогда заведите новый договор (create_contract). Форму, НДС и " +
+      "организацию договора-оферты ведёт balance. Уже созданные в 1С документы остаются на " +
       "прежнем договоре 1С; следующие счета и акты прежний сервис 1С найдёт или заведёт по новым номеру, дате и " +
       "названию — основание счёта печатается как «<название> <номер> от <дата>». Ответ — договор, changes (было → " +
       "стало) и warnings. Правка пишется в журнал.",
@@ -52,6 +94,10 @@ export function registerContractTools(server: McpServer) {
       contract_status: z.union([z.literal(-1), z.literal(0), z.literal(1), z.literal(2), z.literal(3)]).optional()
         .describe("-1 отклонён, 0 черновик, 1 на подписании, 2 действует, 3 исполнен"),
       comment: z.string().max(5000).optional().describe("Комментарий (пустая строка — очистить)"),
+      contract_type: z.string().min(1).max(64).optional()
+        .describe("Код печатной формы (как в карточке: routerai_v3, routerai_reseller, sms, email…)"),
+      vat: z.enum(["5", "22", "no"]).optional().describe("НДС по договору: 5, 22 или no (без НДС)"),
+      org_id: z.number().int().positive().optional().describe("Наша организация (list_organizations)"),
     },
   }, async (a, extra) => {
     const { id, ...rest } = a;

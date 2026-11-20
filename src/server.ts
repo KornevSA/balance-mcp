@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerCustomerTools } from "./tools/customers.js";
+import { registerCustomerLinkTools } from "./tools/customerLinks.js";
 import { registerInvoiceTools } from "./tools/invoices.js";
 import { registerDocumentTools } from "./tools/documents.js";
 import { registerClientFileTools } from "./tools/clientFiles.js";
@@ -19,6 +20,7 @@ import { registerEdoTools } from "./tools/edo.js";
 export function createMcpServer(): McpServer {
   const server = new McpServer({ name: "balance-mcp", version: "0.1.0" });
   registerCustomerTools(server);
+  registerCustomerLinkTools(server);
   registerInvoiceTools(server);
   registerDocumentTools(server);
   registerClientFileTools(server);
